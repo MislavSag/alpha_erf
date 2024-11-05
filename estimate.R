@@ -17,8 +17,8 @@ i = as.integer(Sys.getenv('PBS_ARRAY_INDEX'))
 
 # Import data
 print("Import data")
-dt = open_dataset("data/prices.csv", format = "csv") |>
-  dplyr::filter(id == 1) |>
+dt = open_dataset("/home/jmaric/alpha_erf/data/prices.csv", format = "csv") |>
+  dplyr::filter(id == i) |>
   collect()
 setDT(dt)
 
