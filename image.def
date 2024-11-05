@@ -9,14 +9,14 @@ From: r-base:4.4.0
 
   # Fundamental packages
   R --slave -e 'install.packages("data.table")'
-  R --slave -e 'install.packages("arrow")'
   R --slave -e 'install.packages("dplyr")'
   R --slave -e 'install.packages("foreach")'
   R --slave -e 'install.packages("doParallel")'
   R --slave -e 'install.packages("janitor")'
   R --slave -e 'install.packages("remotes")'
   R --slave -e 'remotes::install_github("nicolagnecco/erf")'
-
+  R --slave -e 'install.packages("cpp11")'
+  R --slave -e 'install.packages("arrow")'
 
 %runscript
   # Script to run when the container is executed; passes commands to Rscript
