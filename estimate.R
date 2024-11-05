@@ -52,7 +52,7 @@ for (s in dt[, unique(symbol)]) {
   # estimation
   cl = makeCluster(8L)
   registerDoParallel(cl)
-  l = foreach(i = 1000:1005, # 1:length(dates)
+  l = foreach(i = 1:length(dates),
               .packages = c("data.table", "erf", "janitor"),
               .export = c("dt_", "s", "predictors")) %dopar% {
                 d = dates[i]
