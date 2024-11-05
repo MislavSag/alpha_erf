@@ -23,11 +23,13 @@ From: r-base:4.4.0
     libjemalloc-dev \
     libmimalloc-dev
 
-  # Set environment variables for compiler flags
-  echo 'export CXXFLAGS="-msse4.2 -O3"' >> /etc/profile.d/arrow_build.sh
-  echo 'export CFLAGS="-msse4.2 -O3"' >> /etc/profile.d/arrow_build.sh
-  echo 'export CXXFLAGS="$CXXFLAGS -Wno-error=implicit-function-declaration"' >> /etc/profile.d/arrow_build.sh
-  source /etc/profile.d/arrow_build.sh
+  # Set environment variables for compiler flags directly
+  export CXXFLAGS="-msse4.2 -O3 -Wno-error=implicit-function-declaration"
+  export CFLAGS="-msse4.2 -O3"
+
+  # Optionally, persist these variables by adding them to the environment
+  echo 'export CXXFLAGS="-msse4.2 -O3 -Wno-error=implicit-function-declaration"' >> /etc/environment
+  echo 'export CFLAGS="-msse4.2 -O3"' >> /etc/environment
 
   # Install Fundamental R packages
   R --slave -e 'install.packages(c("data.table", "dplyr", "foreach", "doParallel", "janitor", "remotes"))'
