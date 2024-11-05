@@ -1,14 +1,14 @@
 suppressMessages(library(data.table)) 
 suppressMessages(library(erf))
 suppressMessages(library(janitor))
-suppressMessages(library(arrow))
-suppressMessages(library(dplyr))
+# suppressMessages(library(arrow))
+# suppressMessages(library(dplyr))
 suppressMessages(library(foreach))
 suppressMessages(library(doParallel))
 
 
 # setup
-SAVEPATH = file.path("data/results")
+SAVEPATH = file.path("results")
 if (!dir.exists(SAVEPATH)) dir.create(SAVEPATH, recursive = TRUE)
 
 # Get index
@@ -16,12 +16,9 @@ i = as.integer(Sys.getenv('PBS_ARRAY_INDEX'))
 # i = 1
 
 # Import data
-print(paste0("Import data for index", i))
-print(list.files("."))
-dt = open_dataset("/home/jmaric/alpha_erf/data/prices.csv", format = "csv") |>
-  dplyr::filter(id == i) |>
-  collect()
-setDT(dt)
+print("Import data")
+file_ = paste0("data/prices_", i, ".csv")
+dt = fread(file_, drop = c("close_raw", "close", "returns"))
 
 # Select some date interval
 print("Define dates")
@@ -38,8 +35,7 @@ print("Variables and params")
 quantile_levels = c(0.0005, 0.01, 0.02, 0.05, 0.95, 0.98, 0.99, 0.995)
 setorder(dt, symbol, date)
 predictors = dt[, colnames(.SD), 
-                .SDcols = -c("id", "symbol", "date", "close", "close_raw",
-                                 "returns", "target")]
+                .SDcols = -c("id", "symbol", "date", "target")]
 
 # Estimate
 print("Estimate")

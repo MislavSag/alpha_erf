@@ -129,9 +129,12 @@ setnames(symbols_chunks, c("id", "symbol"))
 # Merge symbols ids and pricers
 prices = symbols_chunks[prices, on = "symbol"]
 
-# Save local temporarily
+# Save every id separetly
 if (!dir.exists("data")) dir.create("data")
-fwrite(prices, "data/prices.csv")
+for (i in prices[, unique(id)]) {
+  prices_ = prices[id == i]
+  fwrite(prices_, paste0("data/prices_", i, ".csv"))
+}
 
 # Add file to padobran
-# scp -r /home/sn/projects_r/alpha_erf/data/prices.csv padobran:/home/jmaric/alpha_erf/data/prices.csv
+# scp -r /home/sn/projects_r/alpha_erf/data padobran:/home/jmaric/alpha_erf/data/
