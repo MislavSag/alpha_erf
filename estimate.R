@@ -1,26 +1,31 @@
-library(data.table)
-library(erf)
-library(janitor)
-library(arrow)
-library(dplyr)
-library(foreach)
-library(doParallel)
+suppressWarnings(library(data.table)) 
+suppressWarnings(library(erf))
+suppressWarnings(library(janitor))
+suppressWarnings(library(arrow))
+suppressWarnings(library(dplyr))
+suppressWarnings(library(foreach))
+suppressWarnings(library(doParallel))
 
 # setup
+print("Setup")
 SAVEPATH = file.path("data/results")
 if (!dir.exists(SAVEPATH)) dir.create(SAVEPATH, recursive = TRUE)
 
 # Get index
+print("get Index")
 i = as.integer(Sys.getenv('PBS_ARRAY_INDEX'))
+print(i)
 # i = 1
 
 # Import data
+print("Import data")
 dt = open_dataset("data/prices.csv", format = "csv") |>
   dplyr::filter(id == 1) |>
   collect()
 setDT(dt)
 
 # Select some date interval
+print("Define dates")
 dates = seq.Date(from = as.Date("2000-01-01"), to = Sys.Date(), by = "day")
 dates = as.Date(intersect(dates, dt[, unique(date)]))
 symbols = dt[, unique(symbol)]
@@ -30,6 +35,7 @@ length(symbols_chunks)
 tail(symbols_chunks)
 
 # Loop over date and symbols and train erf model extract predictions
+print("Variables and params")
 quantile_levels = c(0.0005, 0.01, 0.02, 0.05, 0.95, 0.98, 0.99, 0.995)
 setorder(dt, symbol, date)
 predictors = dt[, colnames(.SD), 
@@ -37,6 +43,7 @@ predictors = dt[, colnames(.SD),
                                  "returns", "target")]
 
 # Estimate
+print("Estimate")
 for (s in dt[, unique(symbol)]) {
   # debug
   # s = "a"
