@@ -2,12 +2,6 @@ library(data.table)
 library(RollingWindow)
 library(DescTools)
 library(TTR)
-# library(janitor)
-# library(PerformanceAnalytics)
-# library(erf)
-# library(foreach)
-# library(parallel)
-# library(doParallel)
 
 
 # PRICE DATA --------------------------------------------------------------
@@ -119,9 +113,25 @@ prices[, rsi := RSI(close, n = 14), by = symbol]
 # Remove columns we don't need
 prices[, c("beta_rank", "beta_rank_pct", "open", "high", "low", "volume") := NULL]
 
+# Create target variable
+setorder(prices, symbol, date)
+prices[, target := shift(close, 1, type = "lead") / close - 1, by = symbol]
+prices = na.omit(prices)
+
+# Split symbols to 10000 chunk eleemnts
+symbols_chunks = prices[, unique(symbol)]
+symbols_chunks = split(symbols_chunks, ceiling(seq_along(symbols_chunks) / (length(symbols_chunks) / 10000)))
+length(symbols_chunks)
+lengths(symbols_chunks)
+symbols_chunks = rbindlist(lapply(symbols_chunks, as.data.table), idcol = "id")
+setnames(symbols_chunks, c("id", "symbol"))
+
+# Merge symbols ids and pricers
+prices = symbols_chunks[prices, on = "symbol"]
+
 # Save local temporarily
 if (!dir.exists("data")) dir.create("data")
 fwrite(prices, "data/prices.csv")
 
 # Add file to padobran
-
+# scp -r /home/sn/projects_r/alpha_erf/data/prices.csv padobran:/home/jmaric/alpha_erf/data/prices.csv
