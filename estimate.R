@@ -1,20 +1,18 @@
-suppressWarnings(library(data.table)) 
-suppressWarnings(library(erf))
-suppressWarnings(library(janitor))
-suppressWarnings(library(arrow))
-suppressWarnings(library(dplyr))
-suppressWarnings(library(foreach))
-suppressWarnings(library(doParallel))
+suppressMessages(library(data.table)) 
+suppressMessages(library(erf))
+suppressMessages(library(janitor))
+suppressMessages(library(arrow))
+suppressMessages(library(dplyr))
+suppressMessages(library(foreach))
+suppressMessages(library(doParallel))
+
 
 # setup
-print("Setup")
 SAVEPATH = file.path("data/results")
 if (!dir.exists(SAVEPATH)) dir.create(SAVEPATH, recursive = TRUE)
 
 # Get index
-print("get Index")
 i = as.integer(Sys.getenv('PBS_ARRAY_INDEX'))
-print(i)
 # i = 1
 
 # Import data
