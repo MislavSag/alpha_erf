@@ -13,7 +13,7 @@ if (!dir.exists(SAVEPATH)) dir.create(SAVEPATH, recursive = TRUE)
 
 # Get index
 i = as.integer(Sys.getenv('PBS_ARRAY_INDEX'))
-# i = 5000
+# i = 5001
 
 # Import data
 print("Import data")
@@ -53,7 +53,7 @@ for (s in dt[, unique(symbol)]) {
   
   # estimation
   l = list()
-  for (i in 1000:1010) { # 1:length(dates)
+  for (i in 1:length(dates)) {
     d = dates[i]
     # d = dates[1]
     
