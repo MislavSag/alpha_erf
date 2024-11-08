@@ -3,7 +3,7 @@
 #PBS -N ERF
 #PBS -l ncpus=8
 #PBS -l mem=16GB
-#PBS -J 1-10000
+#PBS -J 5000-5020
 #PBS -o logs
 #PBS -j oe
 
