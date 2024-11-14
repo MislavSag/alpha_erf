@@ -80,7 +80,7 @@ for (s in dt[, unique(symbol)]) {
     )
     
     # Fit model for lower
-    train_data_lower = dt_[target < 0]
+    train_data_lower = dtd[target < 0]
     erf_model_lower = erf(
       X = as.matrix(train_data_lower[, .SD, .SDcols = predictors]),
       Y = -train_data_lower[, target],

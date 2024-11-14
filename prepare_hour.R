@@ -164,5 +164,12 @@ for (i in prices[, unique(id)]) {
   fwrite(prices_, file.path(dirname_, paste0("prices_", i, ".csv")))
 }
 
+# Save all trading hours
+dates_ = prices[, .(date = unique(date))]
+setorder(dates_, date)
+dates_[, date := as.character(date)]
+fwrite(dates_, "dates.csv")
+
 # Add file to padobran
 # scp -r /home/sn/projects_r/alpha_erf/data_hour padobran:/home/jmaric/alpha_erf/data_hour/
+# scp -r /home/sn/projects_r/alpha_erf/dates.csv padobran:/home/jmaric/alpha_erf/dates.csv
