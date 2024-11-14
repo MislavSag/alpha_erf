@@ -38,7 +38,11 @@ predictors = dt[, colnames(.SD),
 s = dt[, data.table::first(symbol)]
 file_name = file.path(SAVEPATH, paste0(s, ".csv"))
 if (file.exists(file_name)) next
-  
+
+print(dt)
+print(s)
+print(dates)
+
 # estimation
 l = list()
 for (i in 1:length(dates)) { # 1:length(dates
