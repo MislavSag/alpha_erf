@@ -41,7 +41,7 @@ if (file.exists(file_name)) next
   
 # estimation
 l = list()
-for (i in 10000:10002) { # 1:length(dates)
+for (i in 1:length(dates)) { # 1:length(dates
   d = dates[i]
   # d = dates[10000]
   
