@@ -10,6 +10,15 @@ library(ggplot2)
 library(TTR)
 
 
+
+# CHECKS ------------------------------------------------------------------
+# Check have many symbols are in total
+files = list.files("data", full.names = TRUE, pattern = "csv")
+symbols = lapply(files, fread, select = "symbol") 
+symbols = rbindlist(symbols)
+symbols[, length(unique(symbol))]
+
+
 # DATA --------------------------------------------------------------------
 # Set up
 PATH = "/home/sn/data/strategies/alpha_erf/results"

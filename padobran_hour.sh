@@ -1,12 +1,13 @@
+
 #!/bin/bash
 
-#PBS -N ERF
+#PBS -N ERFHOUR
 #PBS -l ncpus=8
-#PBS -l mem=16GB
-#PBS -J 1-10000
-#PBS -o logs
+#PBS -l mem=10GB
+#PBS -J 1-829
+#PBS -o logs_hour
 #PBS -j oe
 
 cd ${PBS_O_WORKDIR}
-
 apptainer run image.sif estimate.R
+

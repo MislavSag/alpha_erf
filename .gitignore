@@ -3,4 +3,8 @@
 .RData
 .Ruserdata
 data/
+data_hour/
 .Renviron
+prices_hour.csv
+results/
+results_hour/

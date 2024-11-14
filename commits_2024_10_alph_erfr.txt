@@ -1,0 +1,1608 @@
+6c615f24366ceb07870cb9a2d88b05f7fe0f96cf MislavSag Fri Nov 8 23:48:12 2024 +0100 remove parallel
+diff --git a/estimate.R b/estimate.R
+index 54a5378..41e6b92 100644
+--- a/estimate.R
++++ b/estimate.R
+@@ -13,7 +13,7 @@ if (!dir.exists(SAVEPATH)) dir.create(SAVEPATH, recursive = TRUE)
+ 
+ # Get index
+ i = as.integer(Sys.getenv('PBS_ARRAY_INDEX'))
+-# i = 5000
++# i = 5001
+ 
+ # Import data
+ print("Import data")
+@@ -53,7 +53,7 @@ for (s in dt[, unique(symbol)]) {
+   
+   # estimation
+   l = list()
+-  for (i in 1000:1010) { # 1:length(dates)
++  for (i in 1:length(dates)) {
+     d = dates[i]
+     # d = dates[1]
+     
+diff --git a/prepare_hour.R b/prepare_hour.R
+new file mode 100644
+index 0000000..16813c8
+--- /dev/null
++++ b/prepare_hour.R
+@@ -0,0 +1,140 @@
++library(data.table)
++library(RollingWindow)
++library(DescTools)
++library(TTR)
++
++
++# PRICE DATA --------------------------------------------------------------
++# Import QC daily data
++if (interactive()) {
++  prices = fread("/home/sn/lean/data/stocks_daily.csv")
++} else {
++  prices = fread("stocks_daily.csv")
++}
++setnames(prices, gsub(" ", "_", c(tolower(colnames(prices)))))
++
++# Remove duplicates
++prices = unique(prices, by = c("symbol", "date"))
++
++# Remove duplicates - there are same for different symbols (eg. phun and phun.1)
++dups = prices[, .(symbol , n = .N),
++              by = .(date, open, high, low, close, volume, adj_close,
++                     symbol_first = substr(symbol, 1, 1))]
++dups = dups[n > 1]
++dups[, symbol_short := gsub("\\.\\d$", "", symbol)]
++symbols_remove = dups[, .(symbol, n = .N),
++                      by = .(date, open, high, low, close, volume, adj_close,
++                             symbol_short)]
++symbols_remove[n >= 2, unique(symbol)]
++symbols_remove = symbols_remove[n >= 2, unique(symbol)]
++symbols_remove = symbols_remove[grepl("\\.", symbols_remove)]
++prices = prices[symbol %notin% symbols_remove]
++
++# Adjust all columns
++prices[, adj_rate := adj_close / close]
++prices[, let(
++  open = open*adj_rate,
++  high = high*adj_rate,
++  low = low*adj_rate
++)]
++setnames(prices, "close", "close_raw")
++setnames(prices, "adj_close", "close")
++prices[, let(adj_rate = NULL)]
++setcolorder(prices, c("symbol", "date", "open", "high", "low", "close", "volume"))
++
++# Remove observations where open, high, low, close columns are below 1e-008
++# This step is opional, we need it if we will use finfeatures package
++prices = prices[open > 1e-008 & high > 1e-008 & low > 1e-008 & close > 1e-008]
++
++# Sort
++setorder(prices, symbol, date)
++
++# Calculate returns
++prices[, returns := close / shift(close, 1) - 1]
++
++# Remove missing values
++prices = na.omit(prices)
++
++# Set SPY returns as market returns
++spy_ret = na.omit(prices[symbol == "spy", .(date, market_ret = returns)])
++prices = spy_ret[prices, on = "date"]
++
++# Minimal observations per symbol is 253 days
++remove_symbols = prices[, .(symbol, n = .N), by = symbol][n < 253, symbol]
++prices = prices[symbol %notin% remove_symbols]
++
++# Free memory
++gc()
++
++
++# PREDICTORS --------------------------------------------------------------
++# Rolling beta
++setorder(prices, symbol, date)
++prices = prices[, beta := RollingBeta(market_ret, returns, 252, na_method = "ignore"),
++                by = symbol]
++
++# Highest beta by date - 5% of symbols by highest beta
++prices[, beta_rank := frank(abs(beta), ties.method = "dense", na.last = "keep"), by = date]
++prices[, beta_rank_pct := beta_rank / max(beta_rank, na.rm = TRUE), by = date]
++prices[, beta_rank_largest_99 := 0, by = date]
++prices[beta_rank_pct > 0.99, beta_rank_largest_99 := 1, by = date]
++prices[, beta_rank_largest_95 := 0, by = date]
++prices[beta_rank_pct > 0.95, beta_rank_largest_95 := 1, by = date]
++prices[, beta_rank_largest_90 := 0, by = date]
++prices[beta_rank_pct > 0.90, beta_rank_largest_90 := 1, by = date]
++setorder(prices, symbol, date)
++
++# Momentum predictors
++months_size = c(3, 6, 9, 12)
++mom_vars = paste0("momentum_", months_size)
++f_ = function(x, n) {
++  shift(x, 21) / shift(x, n * 21) - 1
++}
++prices[, (mom_vars) := lapply(months_size, function(x) f_(close, x)), by = symbol]
++
++# Momentum ensambles
++weights_ = c(12, 6, 3, 1) / sum(c(12, 6, 3, 1))
++prices[, momentum_average := momentum_3 * weights_[1] +
++         momentum_6 * weights_[2] +
++         momentum_9 * weights_[3] +
++         momentum_12 * weights_[4]]
++
++# Dolar volume z-score
++dv_cols = paste0("dollar_volume_zscore_winsorized", months_size)
++f_ = function(x, y, z) RollingZscore(as.numeric(x * y), z, na_method = "ignore")
++prices[, (dv_cols) := lapply(months_size, function(s)  as.vector(f_(close_raw, volume, s * 21))),
++       by = symbol]
++prices[, (dv_cols) := lapply(.SD, function(x) Winsorize(x, val = c(-5, 5))),
++       .SDcols = dv_cols]
++
++# Tecnical indicators
++prices[, rsi := RSI(close, n = 14), by = symbol]
++
++# Remove columns we don't need
++prices[, c("beta_rank", "beta_rank_pct", "open", "high", "low", "volume") := NULL]
++
++# Create target variable
++setorder(prices, symbol, date)
++prices[, target := shift(close, 1, type = "lead") / close - 1, by = symbol]
++prices = na.omit(prices)
++
++# Split symbols to 10000 chunk eleemnts
++symbols_chunks = prices[, unique(symbol)]
++symbols_chunks = split(symbols_chunks, ceiling(seq_along(symbols_chunks) / (length(symbols_chunks) / 10000)))
++length(symbols_chunks)
++lengths(symbols_chunks)
++symbols_chunks = rbindlist(lapply(symbols_chunks, as.data.table), idcol = "id")
++setnames(symbols_chunks, c("id", "symbol"))
++
++# Merge symbols ids and pricers
++prices = symbols_chunks[prices, on = "symbol"]
++
++# Save every id separetly
++if (!dir.exists("data")) dir.create("data")
++for (i in prices[, unique(id)]) {
++  prices_ = prices[id == i]
++  fwrite(prices_, paste0("data/prices_", i, ".csv"))
++}
++
++# Add file to padobran
++# scp -r /home/sn/projects_r/alpha_erf/data padobran:/home/jmaric/alpha_erf/data/
+
+8a1572f474001c506b96a94d00288936bb2608da MislavSag Fri Nov 8 21:21:28 2024 +0100 remove parallel
+diff --git a/.gitignore b/.gitignore
+index d9993dd..734c78b 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -3,3 +3,4 @@
+ .RData
+ .Ruserdata
+ data/
++.Renviron
+
+87a1bfdbb9baece15a06d1bfc851f4d53fa49120 MislavSag Fri Nov 8 21:20:12 2024 +0100 remove parallel
+diff --git a/.Renviron b/.Renviron
+new file mode 100644
+index 0000000..40a9c29
+--- /dev/null
++++ b/.Renviron
+@@ -0,0 +1,2 @@
++BLOB-ENDPOINT-SNP=https://snpmarketdata.blob.core.windows.net
++BLOB-KEY-SNP=0M4WRlV0/1b6b3ZpFKJvevg4xbC/gaNBcdtVZW+zOZcRi0ZLfOm1v/j2FZ4v+o8lycJLu1wVE6HT+ASt0DdAPQ==
+\ No newline at end of file
+diff --git a/estimate.R b/estimate.R
+index 0722455..54a5378 100644
+--- a/estimate.R
++++ b/estimate.R
+@@ -13,7 +13,7 @@ if (!dir.exists(SAVEPATH)) dir.create(SAVEPATH, recursive = TRUE)
+ 
+ # Get index
+ i = as.integer(Sys.getenv('PBS_ARRAY_INDEX'))
+-# i = 1
++# i = 5000
+ 
+ # Import data
+ print("Import data")
+@@ -41,7 +41,7 @@ predictors = dt[, colnames(.SD),
+ print("Estimate")
+ for (s in dt[, unique(symbol)]) {
+   # debug
+-  # s = "a"
++  # s = "jqh"
+   print(s)
+   
+   # Check if already estimated
+@@ -52,62 +52,58 @@ for (s in dt[, unique(symbol)]) {
+   dt_ = dt[symbol == s]
+   
+   # estimation
+-  cl = makeCluster(8L)
+-  registerDoParallel(cl)
+-  l = foreach(i = 1:length(dates),
+-              .packages = c("data.table", "erf", "janitor"),
+-              .export = c("dt_", "s", "predictors")) %dopar% {
+-                d = dates[i]
+-                # d = dates[1]
+-                
+-                # Train data
+-                dtd = dt_[date < d]
+-                if (nrow(dtd) < 252) return(NULL)
+-                if (as.Date(d) - dt_[, as.Date(max(date))] > 2) return(NULL)
+-                
+-                # Test data
+-                test_data = dt_[date == d]
+-                if (nrow(test_data) == 0) return(NULL)
+-                
+-                # Fit model for upper
+-                train_data_upper = dtd[target > 0]
+-                erf_model_upper = erf(
+-                  X = as.matrix(train_data_upper[, .SD, .SDcols = predictors]),
+-                  Y = train_data_upper[, target],
+-                  min.node.size = 5,
+-                  lambda = 0.001,
+-                  intermediate_quantile = 0.8
+-                )
+-                
+-                # Fit model for lower
+-                train_data_lower = dt_[target < 0]
+-                erf_model_lower = erf(
+-                  X = as.matrix(train_data_lower[, .SD, .SDcols = predictors]),
+-                  Y = -train_data_lower[, target],
+-                  min.node.size = 5,
+-                  lambda = 0.001,
+-                  intermediate_quantile = 0.8
+-                )
+-                
+-                # Predict
+-                erf_predictions_upper = predict(
+-                  erf_model_upper,
+-                  as.matrix(test_data[, .SD, .SDcols = predictors]),
+-                  quantiles = quantile_levels
+-                )
+-                erf_predictions_lower = predict(
+-                  erf_model_lower,
+-                  as.matrix(test_data[, .SD, .SDcols = predictors]),
+-                  quantiles = quantile_levels
+-                )
+-                erf_predictions_upper = clean_names(as.data.frame(erf_predictions_upper))
+-                colnames(erf_predictions_upper) = paste0("upper_", colnames(erf_predictions_upper))
+-                erf_predictions_lower = clean_names(as.data.frame(erf_predictions_lower))
+-                colnames(erf_predictions_lower) = paste0("lower_", colnames(erf_predictions_lower))
+-                cbind(symbol = s, date = d, erf_predictions_upper, erf_predictions_lower,
+-                      targetr = test_data[, target])
+-              }
+-  stopCluster(cl)
++  l = list()
++  for (i in 1000:1010) { # 1:length(dates)
++    d = dates[i]
++    # d = dates[1]
++    
++    # Train data
++    dtd = dt_[date < d]
++    if (nrow(dtd) < 252)
++      return(NULL)
++    if (as.Date(d) - dt_[, as.Date(max(date))] > 2)
++      return(NULL)
++    
++    # Test data
++    test_data = dt_[date == d]
++    if (nrow(test_data) == 0)
++      return(NULL)
++    
++    # Fit model for upper
++    train_data_upper = dtd[target > 0]
++    erf_model_upper = erf(
++      X = as.matrix(train_data_upper[, .SD, .SDcols = predictors]),
++      Y = train_data_upper[, target],
++      min.node.size = 5,
++      lambda = 0.001,
++      intermediate_quantile = 0.8
++    )
++    
++    # Fit model for lower
++    train_data_lower = dt_[target < 0]
++    erf_model_lower = erf(
++      X = as.matrix(train_data_lower[, .SD, .SDcols = predictors]),
++      Y = -train_data_lower[, target],
++      min.node.size = 5,
++      lambda = 0.001,
++      intermediate_quantile = 0.8
++    )
++    
++    # Predict
++    erf_predictions_upper = predict(erf_model_upper, as.matrix(test_data[, .SD, .SDcols = predictors]), quantiles = quantile_levels)
++    erf_predictions_lower = predict(erf_model_lower, as.matrix(test_data[, .SD, .SDcols = predictors]), quantiles = quantile_levels)
++    erf_predictions_upper = clean_names(as.data.frame(erf_predictions_upper))
++    colnames(erf_predictions_upper) = paste0("upper_", colnames(erf_predictions_upper))
++    erf_predictions_lower = clean_names(as.data.frame(erf_predictions_lower))
++    colnames(erf_predictions_lower) = paste0("lower_", colnames(erf_predictions_lower))
++    l[[i]] = cbind(
++      symbol = s,
++      date = d,
++      erf_predictions_upper,
++      erf_predictions_lower,
++      targetr = test_data[, target]
++    )
++  }
+   
+   # Clean and save
+   x = rbindlist(l)
+diff --git a/padobran.sh b/padobran.sh
+index 028bc83..85fd61c 100644
+--- a/padobran.sh
++++ b/padobran.sh
+@@ -3,7 +3,7 @@
+ #PBS -N ERF
+ #PBS -l ncpus=8
+ #PBS -l mem=16GB
+-#PBS -J 1-10000
++#PBS -J 5000-5020
+ #PBS -o logs
+ #PBS -j oe
+ 
+diff --git a/strategy.R b/strategy.R
+new file mode 100644
+index 0000000..4ccee2b
+--- /dev/null
++++ b/strategy.R
+@@ -0,0 +1,511 @@
++# import data from padobran
++# scp -r padobran:/home/jmaric/alpha_erf/results/ /home/sn/data/strategies/alpha_erf/ 
++
++library(data.table)
++library(erf)
++library(AzureStor)
++library(arrow)
++library(PerformanceAnalytics)
++library(ggplot2)
++library(TTR)
++
++
++# DATA --------------------------------------------------------------------
++# Set up
++PATH = "/home/sn/data/strategies/alpha_erf/results"
++blobendpoint = storage_endpoint(Sys.getenv("BLOB-ENDPOINT-SNP"),
++                                key=Sys.getenv("BLOB-KEY-SNP"))
++cont = storage_container(blobendpoint, "qc-backtest")
++qlcal::calendars
++qlcal::setCalendar("UnitedStates/NYSE")
++
++# Import results
++files = list.files(PATH, full.names = TRUE)
++erf_predictions = lapply(files, fread)
++erf_predictions = erf_predictions[lengths(erf_predictions) > 0]
++
++# Combine all results
++erf_predictions = rbindlist(erf_predictions)
++
++# Summary
++erf_predictions[, .(
++  min_date = min(date),
++  max_date = max(date),
++  number_observations = .N
++)]
++
++# Daily prices
++prices = fread("/home/sn/lean/data/stocks_daily.csv")
++setnames(prices, gsub(" ", "_", c(tolower(colnames(prices)))))
++prices = unique(prices, by = c("symbol", "date"))
++dups = prices[, .(symbol , n = .N),
++              by = .(date, open, high, low, close, volume, adj_close,
++                     symbol_first = substr(symbol, 1, 1))]
++dups = dups[n > 1]
++dups[, symbol_short := gsub("\\.\\d$", "", symbol)]
++symbols_remove = dups[, .(symbol, n = .N),
++                      by = .(date, open, high, low, close, volume, adj_close,
++                             symbol_short)]
++symbols_remove[n >= 2, unique(symbol)]
++symbols_remove = symbols_remove[n >= 2, unique(symbol)]
++symbols_remove = symbols_remove[grepl("\\.", symbols_remove)]
++prices = prices[symbol %notin% symbols_remove]
++prices[, adj_rate := adj_close / close]
++prices[, let(
++  open = open*adj_rate,
++  high = high*adj_rate,
++  low = low*adj_rate
++)]
++setnames(prices, "close", "close_raw")
++setnames(prices, "adj_close", "close")
++prices[, let(adj_rate = NULL)]
++setcolorder(prices, c("symbol", "date", "open", "high", "low", "close", "volume"))
++prices = prices[open > 1e-008 & high > 1e-008 & low > 1e-008 & close > 1e-008]
++setorder(prices, symbol, date)
++prices[, returns := close / shift(close, 1) - 1]
++prices = na.omit(prices)
++spy_ret = na.omit(prices[symbol == "spy", .(date, market_ret = returns)])
++prices = spy_ret[prices, on = "date"]
++remove_symbols = prices[, .(symbol, n = .N), by = symbol][n < 253, symbol]
++prices = prices[symbol %notin% remove_symbols]
++gc()
++
++
++# FILTERING ---------------------------------------------------------------
++# Add label for most liquid asssets
++prices[, dollar_volume_month := frollsum(close_raw * volume, 22, na.rm= TRUE), by = symbol]
++calculate_liquid = function(prices, n) {
++  # dt = copy(prices)
++  # n = 500
++  dt = copy(prices)
++  setorder(dt, date, -dollar_volume_month)
++  filtered = na.omit(dt)[, .(symbol = first(symbol, n)), by = date]
++  col_ = paste0("liquid_", n)
++  filtered[, (col_) := TRUE]
++  dt = filtered[dt, on = c("date", "symbol")]
++  dt[is.na(x), x := FALSE, env = list(x = col_)] # fill NA with FALSE
++  return(dt)
++}
++prices = calculate_liquid(prices, 100)
++prices = calculate_liquid(prices, 200)
++prices = calculate_liquid(prices, 500)
++prices = calculate_liquid(prices, 1000)
++
++# Remove columns we don't need
++prices[, dollar_volume_month := NULL]
++
++
++# PREPARE -----------------------------------------------------------------
++# Convert all predictors to numeric
++erf_predictions[, names(.SD) := lapply(.SD, as.numeric), .SDcols = -c("symbol", "date")]
++
++# Define quantile ratios
++erf_predictions[, qr_995 := upper_quantile_0_995 / lower_quantile_0_995]
++erf_predictions[, qr_99 := upper_quantile_0_99 / lower_quantile_0_99]
++erf_predictions[, qr_98 := upper_quantile_0_98 / lower_quantile_0_98]
++erf_predictions[, qr_95 := upper_quantile_0_95 / lower_quantile_0_95]
++
++# Standardize
++setorder(erf_predictions, symbol, date)
++erf_predictions[, stand_q95 := roll::roll_scale(qr_95, nrow(.SD), min_obs = 44), by = symbol]
++erf_predictions[, stand_q99 := roll::roll_scale(qr_99, nrow(.SD), min_obs = 44), by = symbol]
++erf_predictions[, stand_q98 := roll::roll_scale(qr_98, nrow(.SD), min_obs = 44), by = symbol]
++erf_predictions[, stand_q995 := roll::roll_scale(qr_995, nrow(.SD), min_obs = 44), by = symbol]
++
++# # Merge with prices
++# dt = prices[, .(date, symbol, returns)][erf_predictions, on = c("symbol", "date")]
++
++# Generate signals
++generate_signal = function(dt, threshold, n = 0, q = c("99", "95", "all")) {
++  dt_ = copy(dt)
++  dt_[, signal := 0]
++  if (q == "995") {
++    dt_[stand_q995 > threshold, signal := 1]
++  } else if (q == "99") {
++    dt_[stand_q99 > threshold, signal := 1]
++  } else if (q == "98") {
++    dt_[stand_q98 > threshold, signal := 1]
++  } else if (q == "95") {
++    dt_[stand_q95 > threshold, signal := 1]
++  } else {
++    dt_[stand_q995 > threshold & stand_q99 > threshold & stand_q98 > threshold & stand_q95 > threshold, signal := 1]
++  }
++  dt_[, signal := shift(signal, n), by = symbol]
++  dt_[, strategy_return := targetr * signal]
++  return(na.omit(dt_))
++}
++
++
++# INDIVIDUAL ASSETS -------------------------------------------------------
++# Sample
++symbol_ = erf_predictions[, sample(unique(symbol), 1)]
++# symbol_ = "msft"
++dt_ = erf_predictions[symbol == symbol_]
++
++# Plot quantiles and returns
++cols = c("date", "upper_quantile_0_99", "lower_quantile_0_99",
++         "upper_quantile_0_98", "lower_quantile_0_98",
++         "upper_quantile_0_995", "lower_quantile_0_995",
++         "upper_quantile_0_95", "lower_quantile_0_95", "targetr")
++ggplot(dt_[, ..cols], aes(x = date)) +
++  geom_line(aes(y = upper_quantile_0_99, color = "upper_quantile_0_99")) +
++  geom_line(aes(y = -lower_quantile_0_99, color = "lower_quantile_0_99")) +
++  geom_line(aes(y = upper_quantile_0_95, color = "upper_quantile_0_95")) +
++  geom_line(aes(y = -lower_quantile_0_95, color = "lower_quantile_0_95")) +
++  geom_line(aes(y = upper_quantile_0_98, color = "upper_quantile_0_98")) +
++  geom_line(aes(y = -lower_quantile_0_98, color = "lower_quantile_0_98")) +
++  geom_line(aes(y = upper_quantile_0_995, color = "upper_quantile_0_995")) +
++  geom_line(aes(y = -lower_quantile_0_995, color = "lower_quantile_0_995")) +
++  geom_line(aes(y = targetr, color = "targetr")) +
++  scale_color_manual(values = c("upper_quantile_0_99" = "red",
++                                "lower_quantile_0_99" = "red",
++                                "upper_quantile_0_95" = "blue",
++                                "lower_quantile_0_95" = "blue",
++                                "upper_quantile_0_98" = "green",
++                                "lower_quantile_0_98" = "green",
++                                "upper_quantile_0_995" = "purple",
++                                "lower_quantile_0_995" = "purple",
++                                "targetr" = "black")) +
++  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
++  theme_minimal()
++n_ = 22
++ggplot(dt_[, ..cols], aes(x = date)) +
++  geom_line(aes(y = EMA(upper_quantile_0_99, n_), color = "upper_quantile_0_99")) +
++  geom_line(aes(y = EMA(-lower_quantile_0_99, n_), color = "lower_quantile_0_99")) +
++  geom_line(aes(y = EMA(upper_quantile_0_95, n_), color = "upper_quantile_0_95")) +
++  geom_line(aes(y = EMA(-lower_quantile_0_95, n_), color = "lower_quantile_0_95")) +
++  geom_line(aes(y = EMA(upper_quantile_0_98, n_), color = "upper_quantile_0_98")) +
++  geom_line(aes(y = EMA(-lower_quantile_0_98, n_), color = "lower_quantile_0_98")) +
++  geom_line(aes(y = EMA(upper_quantile_0_995, n_), color = "upper_quantile_0_995")) +
++  geom_line(aes(y = EMA(-lower_quantile_0_995, n_), color = "lower_quantile_0_995")) +
++  geom_line(aes(y = EMA(targetr, n_), color = "targetr")) +
++  scale_color_manual(values = c("upper_quantile_0_99" = "red",
++                                "lower_quantile_0_99" = "red",
++                                "upper_quantile_0_95" = "blue",
++                                "lower_quantile_0_95" = "blue",
++                                "upper_quantile_0_98" = "green",
++                                "lower_quantile_0_98" = "green",
++                                "upper_quantile_0_995" = "purple",
++                                "lower_quantile_0_995" = "purple",
++                                "targetr" = "black")) +
++  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
++  theme_minimal()
++
++# Scatterplot between signal and returns
++ggplot(dt_, aes(x = stand_q95, y = targetr)) +
++  geom_point() +
++  geom_smooth(method = "lm") +
++  theme_minimal()
++ggplot(dt_, aes(x = stand_q98, y = targetr)) +
++  geom_point() +
++  geom_smooth(method = "lm") +
++  theme_minimal()
++ggplot(dt_, aes(x = stand_q99, y = targetr)) +
++  geom_point() +
++  geom_smooth(method = "lm") +
++  theme_minimal()
++ggplot(dt_, aes(x = stand_q995, y = targetr)) +
++  geom_point() +
++  geom_smooth(method = "lm") +
++  theme_minimal()
++ggplot(dt_[stand_q95 > 0], aes(x = stand_q95, y = targetr)) +
++  geom_point() +
++  geom_smooth(method = "lm") +
++  theme_minimal()
++ggplot(dt_[stand_q98 > 0], aes(x = stand_q98, y = targetr)) +
++  geom_point() +
++  geom_smooth(method = "lm") +
++  theme_minimal()
++ggplot(dt_[stand_q99 > 0], aes(x = stand_q99, y = targetr)) +
++  geom_point() +
++  geom_smooth(method = "lm") +
++  theme_minimal()
++ggplot(dt_[stand_q995 > 0], aes(x = stand_q995, y = targetr)) +
++  geom_point() +
++  geom_smooth(method = "lm") +
++  theme_minimal()
++ggplot(dt_[stand_q95 > 0], aes(x = stand_q95, y = targetr)) +
++  geom_point() +
++  geom_smooth(method = "gam") +
++  theme_minimal()
++
++
++# Plot cumulative returns
++symbol_ = "spy"
++symbol_ = erf_predictions[, sample(unique(symbol), 1)]
++back_ = erf_predictions[symbol == symbol_]
++back_ = generate_signal(back_, 0, n = 0, q = "95")
++back_xts = as.xts.data.table(back_[, .(date, strategy_return, targetr)])
++table.AnnualizedReturns(back_xts)
++maxDrawdown(back_xts)
++charts.PerformanceSummary(back_xts, main = back_[1, symbol])
++charts.PerformanceSummary(back_xts["2010/"], main = back_[1, symbol])
++
++# Add to QC to test the strategy\
++qc_data = back_[, .(date, stand_q95, stand_q98, stand_q99, stand_q995)]
++qc_data[, date := paste0(as.character(date), " 16:00:00")]
++storage_write_csv(qc_data, cont, paste0("erf_", back_[1, symbol], ".csv"))
++
++
++# INSAMPLE STOCK OPTIMIZATION ---------------------------------------------
++# # Parameters
++# params = expand.grid(s = erf_predictions[, unique(symbol)],
++#                      q = c("995", "99", "98", "95", "all"),
++#                      t = seq(0.5, 2, 0.1),
++#                      stringsAsFactors = FALSE)
++# 
++# # Calculate portfolio performance for all parameters
++# results = list()
++# for (i in 1:nrow(params)) {
++#   dt_ = erf_predictions[symbol == params$s[i]]
++#   dt_ = generate_signal(copy(dt_), params$t[i], 0, params$q[i])
++#   back_xts = as.xts.data.table(dt_[, .(date, strategy_return, targetr)])
++#   x = table.AnnualizedReturns(back_xts)
++#   x = as.data.table(x, keep.rownames = "var")
++#   x = data.table::transpose(x[, 1:2], make.names = "var")
++#   x = clean_names(x)
++#   results[[i]] = cbind(s = params$s[i], q = params$q[i], t = params$t[i], x)
++# }
++# results_df = rbindlist(results)
++# setnames(results_df, c("symbol", "q", "threshold", "cagr", "std", "SR"))
++# 
++# # list best
++# setorder(results_df, -SR)
++# head(na.omit(results_df), 10)
++# 
++# # list best across symbols
++# setorder(results_df, symbol, -SR)
++# na.omit(results_df)[, head(.SD), by = symbol]
++
++
++# PORTFOLIO ---------------------------------------------------------------
++# Portfolio returns
++portfolio = erf_predictions[, .(symbol, date, stand_q95, stand_q995, targetr)]
++portfolio[, signal := 0]
++portfolio[shift(stand_q95) > 2, signal := 1]
++# portfolio[, signal := shift(signal, 1), by = symbol]
++portfolio[, weights := signal / nrow(.SD[signal == 1]), by = date]
++setorder(portfolio, date)
++portfolio_ret = portfolio[, .(returns = sum(targetr * weights, na.rm = TRUE)), by = date]
++portfolio_ret = as.xts.data.table(portfolio_ret)
++table.AnnualizedReturns(portfolio_ret)
++maxDrawdown(portfolio_ret)
++charts.PerformanceSummary(portfolio_ret)
++charts.PerformanceSummary(portfolio_ret["2020-01/"])
++
++# Add all to QC
++qc_data = erf_predictions[stand_q95 > 2, .(symbol, date, stand_q995, stand_q95)]
++qc_data[, date := as.Date(vapply(as.Date(date), qlcal::advanceDate, FUN.VALUE = double(1L), days = 1))]
++qc_data[, date := paste0(as.character(date), " 15:59:00")]
++qc_data = qc_data[, .(
++  symbol = paste0(symbol, collapse = "|"),
++  qr_99 = paste0(stand_q995, collapse = "|"),
++  qr_95 = paste0(stand_q95, collapse = "|")),
++  by = date]
++setorder(qc_data, date)
++storage_write_csv(qc_data, cont, "erf.csv")
++colnames(qc_data)
++
++# LIQUID PORTFOLIO --------------------------------------------------------
++# Keep only most liquid stocks
++prices_sample = prices[liquid_500 == TRUE]
++
++# Merge erf_predictions with prices
++portfolio = erf_predictions[, .(symbol, date, stand_q95, stand_q98, stand_q99, stand_q995, targetr)][
++  prices_sample[, .(symbol, date, returns)], on = c("symbol", "date")]
++portfolio = na.omit(portfolio)
++
++# Backtest
++portfolio[, signal := 0]
++portfolio[stand_q95 > 0, signal := 1]
++portfolio[, weights := signal / nrow(.SD[signal == 1]), by = date]
++setorder(portfolio, date)
++portfolio_ret = portfolio[, .(returns = sum(targetr * weights, na.rm = TRUE)), by = date]
++portfolio_ret = as.xts.data.table(portfolio_ret)
++table.AnnualizedReturns(portfolio_ret)
++maxDrawdown(portfolio_ret)
++charts.PerformanceSummary(portfolio_ret)
++charts.PerformanceSummary(portfolio_ret["2020-01/"])
++
++# PORTFOLIO CROSS SECTION -------------------------------------------------
++library(portsort)
++# Downsample to monthly frequency
++dtm = copy(prices)
++dtm[, year_month_id := lubridate::ceiling_date(date, unit = "week")]
++dtm = dtm[, .(
++  date = tail(date, 1),
++  open = head(open, 1),
++  high = max(high),
++  low = min(low),
++  close = tail(close, 1),
++  close_raw = tail(close_raw, 1),
++  volume_mean = mean(volume, na.rm = TRUE),
++  volume = sum(volume, na.rm = TRUE)
++), by = c("symbol", "year_month_id")]
++dtm = erf_predictions[, .(symbol, date, stand_q95, stand_q98, stand_q99, stand_q995, targetr)][
++  dtm, on = c("symbol", "date")]
++dtm = na.omit(dtm)
++dtm = dtm[close_raw > 1]
++
++# create forward returns
++setorder(dtm, symbol, date)
++dtm[, ret_forward := shift(close, -1, type = "shift") / close - 1, by = symbol]
++dtm[, .(symbol, year_month_id, close, ret_forward)]
++dtm = na.omit(dtm)
++
++# Portfolio sort
++predictors = c("stand_q95", "stand_q98", "stand_q99", "stand_q995")
++results = list()
++for (i in seq_along(predictors)) {
++  print(i)
++  predictor = predictors[i]
++  print(predictor)
++  
++  # sample data we need
++  sample = dtm[, .SD, .SDcols = c("symbol", "year_month_id", "ret_forward", predictor)]
++
++  # check for duplicates
++  dup_index = which(sample[, duplicated(.SD[, .(symbol, year_month_id)])])
++  sample = unique(sample, by = c("symbol", "year_month_id"))
++  
++  # remove NA values for target
++  sample = na.omit(sample)
++  
++  # predictors matrix
++  Fa = dcast(sample, year_month_id ~ symbol, value.var = predictor)
++  setorder(Fa, year_month_id)
++  Fa = as.xts.data.table(Fa)
++  cols_with_na = apply(Fa, MARGIN = 2, FUN = function(x) sum(is.na(x)) > as.integer(nrow(Fa) * 0.6))
++  Fa = Fa[, !cols_with_na]
++  
++  # remove all NA values
++  rows_with_na <- apply(Fa, MARGIN = 1, FUN = function(x) sum(is.na(x)) > as.integer(ncol(Fa) * 0.99))
++  Fa = Fa[!rows_with_na, ]
++  
++  # Forward returns
++  R_forward = as.xts.data.table(dcast(sample, year_month_id ~ symbol, value.var = "ret_forward"))
++  R_forward = R_forward[, !cols_with_na]
++  R_forward = R_forward[!rows_with_na, ]
++  
++  # uncondtitional sorting
++  dimA = 0:20/20
++  psort_out = tryCatch({
++    unconditional.sort(
++      Fa,
++      Fb = NULL,
++      Fc = NULL,
++      R_forward,
++      dimA = dimA,
++      dimB = NULL,
++      dimC = NULL,
++      type = 7
++    )
++    
++  }, error = function(e) NULL)
++  
++  portsort_dt = table.AnnualizedReturns(psort_out$returns)
++  results[[i]] = setDT(portsort_dt, keep.rownames = TRUE)
++}
++
++# Inspect results
++names(results) = predictors
++results_dt = rbindlist(results, idcol = "predictor")
++results_dt[grep("Sharpe", rn)]
++results_dt[grep("Retu", rn)]
++
++# Create quantile portfolio for every week
++portfolio_sort_week = erf_predictions[, .(symbol, date, stand_q95, targetr)]
++portfolio_sort_week = na.omit(portfolio_sort_week)
++setorder(portfolio_sort_week, date, -stand_q95)
++portfolio_sort_week = portfolio_sort_week[, head(.SD, 50), by = date]
++portfolio_sort_week = portfolio_sort_week[date < as.Date("2024-10-01")]
++portfolio_sort_week[, weight := 1 / nrow(.SD), by = date]
++portfolio_returns = portfolio_sort_week[, sum(targetr * weight, na.rm = TRUE), by = date]
++charts.PerformanceSummary(as.xts.data.table(portfolio_returns))
++charts.PerformanceSummary(as.xts.data.table(portfolio_returns)["2024"])
++
++# Save to Quantconnect
++qc_data = portfolio_sort_week[stand_q95 > 0]
++qc_data[, date := paste0(as.character(date), " 16:00:00")]
++qc_data = qc_data[, .(
++  symbol = paste0(symbol, collapse = "|"),
++  qr_95 = paste0(stand_q95, collapse = "|")),
++  by = date]
++setorder(qc_data, date)
++storage_write_csv(qc_data, cont, "erf_sort.csv")
++
++# SYSTEMIC RISK -----------------------------------------------------------
++# SPY
++spy = open_dataset("/home/sn//lean/data/stocks_daily.csv", format = "csv") |>
++  dplyr::filter(Symbol == "spy") |>
++  dplyr::select(Date, `Adj Close`) |>
++  dplyr::rename(date = Date, close = `Adj Close`) |>
++  dplyr::collect()
++setDT(spy)
++spy[, returns := close / shift(close) - 1]
++
++# Simple aggregation
++sr = erf_predictions[, .(symbol, date, stand_q95, stand_q995, targetr)]
++setorder(sr, symbol, date)
++sr = na.omit(sr)
++sr = sr[, .(
++  mean = mean(stand_q95),
++  median = median(stand_q95),
++  sd = sd(stand_q95)
++), by = date]
++plot(as.xts.data.table(sr),
++     main = "Systemic Risk",
++     ylab = "Standardized Quantile 95",
++     col = c("blue", "red", "green"),
++     lwd = 2,
++     legend.loc = "topleft")
++
++# Backtest
++back = spy[, .(date, returns)][sr, on = "date"]
++setorder(back, date)
++predictors = colnames(back)[3:ncol(back)]
++back[, (predictors) := lapply(.SD, shift, n = 1), .SDcols = predictors]
++back[, strategy := ifelse(mean > -0.3, returns, 0)]
++back_xts = as.xts.data.table(na.omit(back)[, .(date, strategy, returns)])
++table.AnnualizedReturns(back_xts)
++maxDrawdown(back_xts)
++charts.PerformanceSummary(back_xts)
++charts.PerformanceSummary(back_xts["2020/"])
++
++# Aggreagte by dollar volume
++prices_sample = prices[liquid_100 == TRUE]
++sr = erf_predictions[, .(symbol, date, stand_q95, stand_q995, targetr)]
++setorder(sr, symbol, date)
++sr = na.omit(sr)
++sr = prices_sample[sr, on = c("symbol", "date")]
++sr = na.omit(sr)
++sr = sr[, .(
++  mean = mean(stand_q95),
++  median = median(stand_q95),
++  sd = sd(stand_q95)
++), by = date]
++plot(as.xts.data.table(sr),
++     main = "Systemic Risk",
++     ylab = "Standardized Quantile 95",
++     col = c("blue", "red", "green"),
++     lwd = 2,
++     legend.loc = "topleft")
++
++# Backtest
++back = spy[, .(date, returns)][sr, on = "date"]
++setorder(back, date)
++predictors = colnames(back)[3:ncol(back)]
++back[, (predictors) := lapply(.SD, shift, n = 1), .SDcols = predictors]
++back[, strategy := ifelse(mean > 0, returns, 0)]
++back_xts = as.xts.data.table(na.omit(back)[, .(date, strategy, returns)])
++table.AnnualizedReturns(back_xts)
++maxDrawdown(back_xts)
++charts.PerformanceSummary(back_xts)
++charts.PerformanceSummary(back_xts["2020/"])
++
++# Add to Quantconnect
++qc_data = spy[, .(date, returns)][sr, on = "date"]
++setorder(qc_data, date)
++qc_data = qc_data[, .(date, mean)]
++qc_data[, date := paste0(as.character(date), " 16:00:00")]
++storage_write_csv(qc_data, cont, paste0("erf_risk.csv"))
+
+dc704cc5f221c22cacb8d4bc80c3d5b96229b725 MislavSag Tue Nov 5 17:58:31 2024 +0100 divide and concuer
+diff --git a/estimate.R b/estimate.R
+index 549eb37..0722455 100644
+--- a/estimate.R
++++ b/estimate.R
+@@ -1,14 +1,14 @@
+ suppressMessages(library(data.table)) 
+ suppressMessages(library(erf))
+ suppressMessages(library(janitor))
+-suppressMessages(library(arrow))
+-suppressMessages(library(dplyr))
++# suppressMessages(library(arrow))
++# suppressMessages(library(dplyr))
+ suppressMessages(library(foreach))
+ suppressMessages(library(doParallel))
+ 
+ 
+ # setup
+-SAVEPATH = file.path("data/results")
++SAVEPATH = file.path("results")
+ if (!dir.exists(SAVEPATH)) dir.create(SAVEPATH, recursive = TRUE)
+ 
+ # Get index
+@@ -16,12 +16,9 @@ i = as.integer(Sys.getenv('PBS_ARRAY_INDEX'))
+ # i = 1
+ 
+ # Import data
+-print(paste0("Import data for index", i))
+-print(list.files("."))
+-dt = open_dataset("/home/jmaric/alpha_erf/data/prices.csv", format = "csv") |>
+-  dplyr::filter(id == i) |>
+-  collect()
+-setDT(dt)
++print("Import data")
++file_ = paste0("data/prices_", i, ".csv")
++dt = fread(file_, drop = c("close_raw", "close", "returns"))
+ 
+ # Select some date interval
+ print("Define dates")
+@@ -38,8 +35,7 @@ print("Variables and params")
+ quantile_levels = c(0.0005, 0.01, 0.02, 0.05, 0.95, 0.98, 0.99, 0.995)
+ setorder(dt, symbol, date)
+ predictors = dt[, colnames(.SD), 
+-                .SDcols = -c("id", "symbol", "date", "close", "close_raw",
+-                                 "returns", "target")]
++                .SDcols = -c("id", "symbol", "date", "target")]
+ 
+ # Estimate
+ print("Estimate")
+diff --git a/padobran.sh b/padobran.sh
+index 5fab67c..028bc83 100644
+--- a/padobran.sh
++++ b/padobran.sh
+@@ -2,7 +2,7 @@
+ 
+ #PBS -N ERF
+ #PBS -l ncpus=8
+-#PBS -l mem=2GB
++#PBS -l mem=16GB
+ #PBS -J 1-10000
+ #PBS -o logs
+ #PBS -j oe
+diff --git a/prepare.R b/prepare.R
+index 321b104..16813c8 100644
+--- a/prepare.R
++++ b/prepare.R
+@@ -129,9 +129,12 @@ setnames(symbols_chunks, c("id", "symbol"))
+ # Merge symbols ids and pricers
+ prices = symbols_chunks[prices, on = "symbol"]
+ 
+-# Save local temporarily
++# Save every id separetly
+ if (!dir.exists("data")) dir.create("data")
+-fwrite(prices, "data/prices.csv")
++for (i in prices[, unique(id)]) {
++  prices_ = prices[id == i]
++  fwrite(prices_, paste0("data/prices_", i, ".csv"))
++}
+ 
+ # Add file to padobran
+-# scp -r /home/sn/projects_r/alpha_erf/data/prices.csv padobran:/home/jmaric/alpha_erf/data/prices.csv
++# scp -r /home/sn/projects_r/alpha_erf/data padobran:/home/jmaric/alpha_erf/data/
+
+823dd8a4635758421261f85a7ffbb96c5797d702 MislavSag Tue Nov 5 13:37:29 2024 +0100 installation problems
+diff --git a/estimate.R b/estimate.R
+index 986c8ca..549eb37 100644
+--- a/estimate.R
++++ b/estimate.R
+@@ -17,6 +17,7 @@ i = as.integer(Sys.getenv('PBS_ARRAY_INDEX'))
+ 
+ # Import data
+ print(paste0("Import data for index", i))
++print(list.files("."))
+ dt = open_dataset("/home/jmaric/alpha_erf/data/prices.csv", format = "csv") |>
+   dplyr::filter(id == i) |>
+   collect()
+
+1ea3d98260c96a93f14d025a99fd2940890e39c1 MislavSag Tue Nov 5 13:36:47 2024 +0100 installation problems
+diff --git a/estimate.R b/estimate.R
+index 6b780b4..986c8ca 100644
+--- a/estimate.R
++++ b/estimate.R
+@@ -16,7 +16,7 @@ i = as.integer(Sys.getenv('PBS_ARRAY_INDEX'))
+ # i = 1
+ 
+ # Import data
+-print("Import data")
++print(paste0("Import data for index", i))
+ dt = open_dataset("/home/jmaric/alpha_erf/data/prices.csv", format = "csv") |>
+   dplyr::filter(id == i) |>
+   collect()
+
+23979405c032f5586e3fb08d87d74aa6265f924e MislavSag Tue Nov 5 13:35:45 2024 +0100 installation problems
+diff --git a/estimate.R b/estimate.R
+index 39a7573..6b780b4 100644
+--- a/estimate.R
++++ b/estimate.R
+@@ -17,8 +17,8 @@ i = as.integer(Sys.getenv('PBS_ARRAY_INDEX'))
+ 
+ # Import data
+ print("Import data")
+-dt = open_dataset("data/prices.csv", format = "csv") |>
+-  dplyr::filter(id == 1) |>
++dt = open_dataset("/home/jmaric/alpha_erf/data/prices.csv", format = "csv") |>
++  dplyr::filter(id == i) |>
+   collect()
+ setDT(dt)
+ 
+
+51dd3e1b9d380e27ed3f1b24fcb2258a20996198 MislavSag Tue Nov 5 13:26:01 2024 +0100 installation problems
+diff --git a/estimate.R b/estimate.R
+index d5db012..39a7573 100644
+--- a/estimate.R
++++ b/estimate.R
+@@ -1,20 +1,18 @@
+-suppressWarnings(library(data.table)) 
+-suppressWarnings(library(erf))
+-suppressWarnings(library(janitor))
+-suppressWarnings(library(arrow))
+-suppressWarnings(library(dplyr))
+-suppressWarnings(library(foreach))
+-suppressWarnings(library(doParallel))
++suppressMessages(library(data.table)) 
++suppressMessages(library(erf))
++suppressMessages(library(janitor))
++suppressMessages(library(arrow))
++suppressMessages(library(dplyr))
++suppressMessages(library(foreach))
++suppressMessages(library(doParallel))
++
+ 
+ # setup
+-print("Setup")
+ SAVEPATH = file.path("data/results")
+ if (!dir.exists(SAVEPATH)) dir.create(SAVEPATH, recursive = TRUE)
+ 
+ # Get index
+-print("get Index")
+ i = as.integer(Sys.getenv('PBS_ARRAY_INDEX'))
+-print(i)
+ # i = 1
+ 
+ # Import data
+
+9a1b8653367eaad9ba20161ed4e130bd5eb7a802 MislavSag Tue Nov 5 12:58:26 2024 +0100 installation problems
+diff --git a/estimate.R b/estimate.R
+index 8e21ad2..d5db012 100644
+--- a/estimate.R
++++ b/estimate.R
+@@ -1,26 +1,31 @@
+-library(data.table)
+-library(erf)
+-library(janitor)
+-library(arrow)
+-library(dplyr)
+-library(foreach)
+-library(doParallel)
++suppressWarnings(library(data.table)) 
++suppressWarnings(library(erf))
++suppressWarnings(library(janitor))
++suppressWarnings(library(arrow))
++suppressWarnings(library(dplyr))
++suppressWarnings(library(foreach))
++suppressWarnings(library(doParallel))
+ 
+ # setup
++print("Setup")
+ SAVEPATH = file.path("data/results")
+ if (!dir.exists(SAVEPATH)) dir.create(SAVEPATH, recursive = TRUE)
+ 
+ # Get index
++print("get Index")
+ i = as.integer(Sys.getenv('PBS_ARRAY_INDEX'))
++print(i)
+ # i = 1
+ 
+ # Import data
++print("Import data")
+ dt = open_dataset("data/prices.csv", format = "csv") |>
+   dplyr::filter(id == 1) |>
+   collect()
+ setDT(dt)
+ 
+ # Select some date interval
++print("Define dates")
+ dates = seq.Date(from = as.Date("2000-01-01"), to = Sys.Date(), by = "day")
+ dates = as.Date(intersect(dates, dt[, unique(date)]))
+ symbols = dt[, unique(symbol)]
+@@ -30,6 +35,7 @@ length(symbols_chunks)
+ tail(symbols_chunks)
+ 
+ # Loop over date and symbols and train erf model extract predictions
++print("Variables and params")
+ quantile_levels = c(0.0005, 0.01, 0.02, 0.05, 0.95, 0.98, 0.99, 0.995)
+ setorder(dt, symbol, date)
+ predictors = dt[, colnames(.SD), 
+@@ -37,6 +43,7 @@ predictors = dt[, colnames(.SD),
+                                  "returns", "target")]
+ 
+ # Estimate
++print("Estimate")
+ for (s in dt[, unique(symbol)]) {
+   # debug
+   # s = "a"
+@@ -110,4 +117,4 @@ for (s in dt[, unique(symbol)]) {
+   # Clean and save
+   x = rbindlist(l)
+   fwrite(x, file_name)
+-}
+\ No newline at end of file
++}
+
+b0354aeffac3de8a75a58f9a56cc3816bd8e5855 MislavSag Tue Nov 5 12:48:31 2024 +0100 installation problems
+diff --git a/estimate.R b/estimate.R
+index 0bf232c..8e21ad2 100644
+--- a/estimate.R
++++ b/estimate.R
+@@ -52,7 +52,7 @@ for (s in dt[, unique(symbol)]) {
+   # estimation
+   cl = makeCluster(8L)
+   registerDoParallel(cl)
+-  l = foreach(i = 1000:1005, # 1:length(dates)
++  l = foreach(i = 1:length(dates),
+               .packages = c("data.table", "erf", "janitor"),
+               .export = c("dt_", "s", "predictors")) %dopar% {
+                 d = dates[i]
+
+93e04ff9c4a73ad719141b1e7690505cbb3ba6c5 MislavSag Tue Nov 5 12:06:45 2024 +0100 installation problems
+diff --git a/image.def b/image.def
+index afeda96..bf8dff1 100644
+--- a/image.def
++++ b/image.def
+@@ -23,11 +23,13 @@ From: r-base:4.4.0
+     libjemalloc-dev \
+     libmimalloc-dev
+ 
+-  # Set environment variables for compiler flags
+-  echo 'export CXXFLAGS="-msse4.2 -O3"' >> /etc/profile.d/arrow_build.sh
+-  echo 'export CFLAGS="-msse4.2 -O3"' >> /etc/profile.d/arrow_build.sh
+-  echo 'export CXXFLAGS="$CXXFLAGS -Wno-error=implicit-function-declaration"' >> /etc/profile.d/arrow_build.sh
+-  source /etc/profile.d/arrow_build.sh
++  # Set environment variables for compiler flags directly
++  export CXXFLAGS="-msse4.2 -O3 -Wno-error=implicit-function-declaration"
++  export CFLAGS="-msse4.2 -O3"
++
++  # Optionally, persist these variables by adding them to the environment
++  echo 'export CXXFLAGS="-msse4.2 -O3 -Wno-error=implicit-function-declaration"' >> /etc/environment
++  echo 'export CFLAGS="-msse4.2 -O3"' >> /etc/environment
+ 
+   # Install Fundamental R packages
+   R --slave -e 'install.packages(c("data.table", "dplyr", "foreach", "doParallel", "janitor", "remotes"))'
+
+aa9f2bcc63df3805a5485b3ba43d14bf79d1c54f MislavSag Tue Nov 5 12:02:14 2024 +0100 installation problems
+diff --git a/image.def b/image.def
+index 9012b91..afeda96 100644
+--- a/image.def
++++ b/image.def
+@@ -2,22 +2,45 @@ Bootstrap: docker
+ From: r-base:4.4.0
+ 
+ %post
+-
+-  # apt
++  # Update package lists
+   apt-get update
+-  apt-get install -y libssl-dev libxml2-dev libcurl4-openssl-dev
+-
+-  # Fundamental packages
+-  R --slave -e 'install.packages("data.table")'
+-  R --slave -e 'install.packages("dplyr")'
+-  R --slave -e 'install.packages("foreach")'
+-  R --slave -e 'install.packages("doParallel")'
+-  R --slave -e 'install.packages("janitor")'
+-  R --slave -e 'install.packages("remotes")'
++
++  # Install essential build tools and dependencies
++  apt-get install -y \
++    build-essential \
++    cmake \
++    libssl-dev \
++    libxml2-dev \
++    libcurl4-openssl-dev \
++    libboost-all-dev \
++    libprotobuf-dev \
++    protobuf-compiler \
++    libsnappy-dev \
++    libzstd-dev \
++    libbrotli-dev \
++    liblz4-dev \
++    libre2-dev \
++    libjemalloc-dev \
++    libmimalloc-dev
++
++  # Set environment variables for compiler flags
++  echo 'export CXXFLAGS="-msse4.2 -O3"' >> /etc/profile.d/arrow_build.sh
++  echo 'export CFLAGS="-msse4.2 -O3"' >> /etc/profile.d/arrow_build.sh
++  echo 'export CXXFLAGS="$CXXFLAGS -Wno-error=implicit-function-declaration"' >> /etc/profile.d/arrow_build.sh
++  source /etc/profile.d/arrow_build.sh
++
++  # Install Fundamental R packages
++  R --slave -e 'install.packages(c("data.table", "dplyr", "foreach", "doParallel", "janitor", "remotes"))'
++
++  # Install GitHub package 'erf'
+   R --slave -e 'remotes::install_github("nicolagnecco/erf")'
++
++  # Install 'cpp11' package
+   R --slave -e 'install.packages("cpp11")'
++
++  # Install 'arrow' package
+   R --slave -e 'install.packages("arrow")'
+ 
+ %runscript
+   # Script to run when the container is executed; passes commands to Rscript
+-  Rscript $@
++  Rscript "$@"
+
+b5a31c601e7143cb00ac1cb1a9d3f92ffb669d2d MislavSag Tue Nov 5 11:12:19 2024 +0100 add image.def file and estimatiinish
+diff --git a/image.def b/image.def
+index 1418a69..9012b91 100644
+--- a/image.def
++++ b/image.def
+@@ -9,14 +9,14 @@ From: r-base:4.4.0
+ 
+   # Fundamental packages
+   R --slave -e 'install.packages("data.table")'
+-  R --slave -e 'install.packages("arrow")'
+   R --slave -e 'install.packages("dplyr")'
+   R --slave -e 'install.packages("foreach")'
+   R --slave -e 'install.packages("doParallel")'
+   R --slave -e 'install.packages("janitor")'
+   R --slave -e 'install.packages("remotes")'
+   R --slave -e 'remotes::install_github("nicolagnecco/erf")'
+-
++  R --slave -e 'install.packages("cpp11")'
++  R --slave -e 'install.packages("arrow")'
+ 
+ %runscript
+   # Script to run when the container is executed; passes commands to Rscript
+
+88891ba4704203ecfa44f31f9a13657b08fafc6e MislavSag Tue Nov 5 11:02:41 2024 +0100 add image.def file and estimatiinish
+diff --git a/padobran.sh b/padobran.sh
+new file mode 100644
+index 0000000..5fab67c
+--- /dev/null
++++ b/padobran.sh
+@@ -0,0 +1,12 @@
++#!/bin/bash
++
++#PBS -N ERF
++#PBS -l ncpus=8
++#PBS -l mem=2GB
++#PBS -J 1-10000
++#PBS -o logs
++#PBS -j oe
++
++cd ${PBS_O_WORKDIR}
++
++apptainer run image.sif estimate.R
+
+77ccc40bc313506e09dd53c3f1de393bf3bd1395 MislavSag Tue Nov 5 10:47:00 2024 +0100 add image.def file and estimatiinish
+diff --git a/image.sh b/image.sh
+new file mode 100644
+index 0000000..dcd2d1e
+--- /dev/null
++++ b/image.sh
+@@ -0,0 +1,3 @@
++#!/bin/bash
++
++apptainer build image.sif image.def
+
+51a8edc8b2d9f83068e4c32222d82566b98fc5e2 MislavSag Tue Nov 5 10:34:04 2024 +0100 add image.def file and estimatiinish
+diff --git a/estimate.R b/estimate.R
+new file mode 100644
+index 0000000..0bf232c
+--- /dev/null
++++ b/estimate.R
+@@ -0,0 +1,113 @@
++library(data.table)
++library(erf)
++library(janitor)
++library(arrow)
++library(dplyr)
++library(foreach)
++library(doParallel)
++
++# setup
++SAVEPATH = file.path("data/results")
++if (!dir.exists(SAVEPATH)) dir.create(SAVEPATH, recursive = TRUE)
++
++# Get index
++i = as.integer(Sys.getenv('PBS_ARRAY_INDEX'))
++# i = 1
++
++# Import data
++dt = open_dataset("data/prices.csv", format = "csv") |>
++  dplyr::filter(id == 1) |>
++  collect()
++setDT(dt)
++
++# Select some date interval
++dates = seq.Date(from = as.Date("2000-01-01"), to = Sys.Date(), by = "day")
++dates = as.Date(intersect(dates, dt[, unique(date)]))
++symbols = dt[, unique(symbol)]
++# divide symbols in chunks so that I have 10.000 chunks. That is i want 10.000 elements in list
++symbols_chunks = split(symbols, ceiling(seq_along(symbols) / ceiling(length(symbols) / 10000)))
++length(symbols_chunks)
++tail(symbols_chunks)
++
++# Loop over date and symbols and train erf model extract predictions
++quantile_levels = c(0.0005, 0.01, 0.02, 0.05, 0.95, 0.98, 0.99, 0.995)
++setorder(dt, symbol, date)
++predictors = dt[, colnames(.SD), 
++                .SDcols = -c("id", "symbol", "date", "close", "close_raw",
++                                 "returns", "target")]
++
++# Estimate
++for (s in dt[, unique(symbol)]) {
++  # debug
++  # s = "a"
++  print(s)
++  
++  # Check if already estimated
++  file_name = file.path(SAVEPATH, paste0(s, ".csv"))
++  if (file.exists(file_name)) next
++  
++  # sample data
++  dt_ = dt[symbol == s]
++  
++  # estimation
++  cl = makeCluster(8L)
++  registerDoParallel(cl)
++  l = foreach(i = 1000:1005, # 1:length(dates)
++              .packages = c("data.table", "erf", "janitor"),
++              .export = c("dt_", "s", "predictors")) %dopar% {
++                d = dates[i]
++                # d = dates[1]
++                
++                # Train data
++                dtd = dt_[date < d]
++                if (nrow(dtd) < 252) return(NULL)
++                if (as.Date(d) - dt_[, as.Date(max(date))] > 2) return(NULL)
++                
++                # Test data
++                test_data = dt_[date == d]
++                if (nrow(test_data) == 0) return(NULL)
++                
++                # Fit model for upper
++                train_data_upper = dtd[target > 0]
++                erf_model_upper = erf(
++                  X = as.matrix(train_data_upper[, .SD, .SDcols = predictors]),
++                  Y = train_data_upper[, target],
++                  min.node.size = 5,
++                  lambda = 0.001,
++                  intermediate_quantile = 0.8
++                )
++                
++                # Fit model for lower
++                train_data_lower = dt_[target < 0]
++                erf_model_lower = erf(
++                  X = as.matrix(train_data_lower[, .SD, .SDcols = predictors]),
++                  Y = -train_data_lower[, target],
++                  min.node.size = 5,
++                  lambda = 0.001,
++                  intermediate_quantile = 0.8
++                )
++                
++                # Predict
++                erf_predictions_upper = predict(
++                  erf_model_upper,
++                  as.matrix(test_data[, .SD, .SDcols = predictors]),
++                  quantiles = quantile_levels
++                )
++                erf_predictions_lower = predict(
++                  erf_model_lower,
++                  as.matrix(test_data[, .SD, .SDcols = predictors]),
++                  quantiles = quantile_levels
++                )
++                erf_predictions_upper = clean_names(as.data.frame(erf_predictions_upper))
++                colnames(erf_predictions_upper) = paste0("upper_", colnames(erf_predictions_upper))
++                erf_predictions_lower = clean_names(as.data.frame(erf_predictions_lower))
++                colnames(erf_predictions_lower) = paste0("lower_", colnames(erf_predictions_lower))
++                cbind(symbol = s, date = d, erf_predictions_upper, erf_predictions_lower,
++                      targetr = test_data[, target])
++              }
++  stopCluster(cl)
++  
++  # Clean and save
++  x = rbindlist(l)
++  fwrite(x, file_name)
++}
+\ No newline at end of file
+diff --git a/image.def b/image.def
+new file mode 100644
+index 0000000..1418a69
+--- /dev/null
++++ b/image.def
+@@ -0,0 +1,23 @@
++Bootstrap: docker
++From: r-base:4.4.0
++
++%post
++
++  # apt
++  apt-get update
++  apt-get install -y libssl-dev libxml2-dev libcurl4-openssl-dev
++
++  # Fundamental packages
++  R --slave -e 'install.packages("data.table")'
++  R --slave -e 'install.packages("arrow")'
++  R --slave -e 'install.packages("dplyr")'
++  R --slave -e 'install.packages("foreach")'
++  R --slave -e 'install.packages("doParallel")'
++  R --slave -e 'install.packages("janitor")'
++  R --slave -e 'install.packages("remotes")'
++  R --slave -e 'remotes::install_github("nicolagnecco/erf")'
++
++
++%runscript
++  # Script to run when the container is executed; passes commands to Rscript
++  Rscript $@
+diff --git a/prepare.R b/prepare.R
+index 6911b74..321b104 100644
+--- a/prepare.R
++++ b/prepare.R
+@@ -2,12 +2,6 @@ library(data.table)
+ library(RollingWindow)
+ library(DescTools)
+ library(TTR)
+-# library(janitor)
+-# library(PerformanceAnalytics)
+-# library(erf)
+-# library(foreach)
+-# library(parallel)
+-# library(doParallel)
+ 
+ 
+ # PRICE DATA --------------------------------------------------------------
+@@ -119,9 +113,25 @@ prices[, rsi := RSI(close, n = 14), by = symbol]
+ # Remove columns we don't need
+ prices[, c("beta_rank", "beta_rank_pct", "open", "high", "low", "volume") := NULL]
+ 
++# Create target variable
++setorder(prices, symbol, date)
++prices[, target := shift(close, 1, type = "lead") / close - 1, by = symbol]
++prices = na.omit(prices)
++
++# Split symbols to 10000 chunk eleemnts
++symbols_chunks = prices[, unique(symbol)]
++symbols_chunks = split(symbols_chunks, ceiling(seq_along(symbols_chunks) / (length(symbols_chunks) / 10000)))
++length(symbols_chunks)
++lengths(symbols_chunks)
++symbols_chunks = rbindlist(lapply(symbols_chunks, as.data.table), idcol = "id")
++setnames(symbols_chunks, c("id", "symbol"))
++
++# Merge symbols ids and pricers
++prices = symbols_chunks[prices, on = "symbol"]
++
+ # Save local temporarily
+ if (!dir.exists("data")) dir.create("data")
+ fwrite(prices, "data/prices.csv")
+ 
+ # Add file to padobran
+-
++# scp -r /home/sn/projects_r/alpha_erf/data/prices.csv padobran:/home/jmaric/alpha_erf/data/prices.csv
+
+6aebaa6a05e6439b904ba2bd51bd84acd51dfacc MislavSag Mon Nov 4 15:05:55 2024 +0100 init
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..d9993dd
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,5 @@
++.Rproj.user
++.Rhistory
++.RData
++.Ruserdata
++data/
+diff --git a/alpha_erf.Rproj b/alpha_erf.Rproj
+new file mode 100644
+index 0000000..8e3c2eb
+--- /dev/null
++++ b/alpha_erf.Rproj
+@@ -0,0 +1,13 @@
++Version: 1.0
++
++RestoreWorkspace: Default
++SaveWorkspace: Default
++AlwaysSaveHistory: Default
++
++EnableCodeIndexing: Yes
++UseSpacesForTab: Yes
++NumSpacesForTab: 2
++Encoding: UTF-8
++
++RnwWeave: Sweave
++LaTeX: pdfLaTeX
+diff --git a/prepare.R b/prepare.R
+new file mode 100644
+index 0000000..6911b74
+--- /dev/null
++++ b/prepare.R
+@@ -0,0 +1,127 @@
++library(data.table)
++library(RollingWindow)
++library(DescTools)
++library(TTR)
++# library(janitor)
++# library(PerformanceAnalytics)
++# library(erf)
++# library(foreach)
++# library(parallel)
++# library(doParallel)
++
++
++# PRICE DATA --------------------------------------------------------------
++# Import QC daily data
++if (interactive()) {
++  prices = fread("/home/sn/lean/data/stocks_daily.csv")
++} else {
++  prices = fread("stocks_daily.csv")
++}
++setnames(prices, gsub(" ", "_", c(tolower(colnames(prices)))))
++
++# Remove duplicates
++prices = unique(prices, by = c("symbol", "date"))
++
++# Remove duplicates - there are same for different symbols (eg. phun and phun.1)
++dups = prices[, .(symbol , n = .N),
++              by = .(date, open, high, low, close, volume, adj_close,
++                     symbol_first = substr(symbol, 1, 1))]
++dups = dups[n > 1]
++dups[, symbol_short := gsub("\\.\\d$", "", symbol)]
++symbols_remove = dups[, .(symbol, n = .N),
++                      by = .(date, open, high, low, close, volume, adj_close,
++                             symbol_short)]
++symbols_remove[n >= 2, unique(symbol)]
++symbols_remove = symbols_remove[n >= 2, unique(symbol)]
++symbols_remove = symbols_remove[grepl("\\.", symbols_remove)]
++prices = prices[symbol %notin% symbols_remove]
++
++# Adjust all columns
++prices[, adj_rate := adj_close / close]
++prices[, let(
++  open = open*adj_rate,
++  high = high*adj_rate,
++  low = low*adj_rate
++)]
++setnames(prices, "close", "close_raw")
++setnames(prices, "adj_close", "close")
++prices[, let(adj_rate = NULL)]
++setcolorder(prices, c("symbol", "date", "open", "high", "low", "close", "volume"))
++
++# Remove observations where open, high, low, close columns are below 1e-008
++# This step is opional, we need it if we will use finfeatures package
++prices = prices[open > 1e-008 & high > 1e-008 & low > 1e-008 & close > 1e-008]
++
++# Sort
++setorder(prices, symbol, date)
++
++# Calculate returns
++prices[, returns := close / shift(close, 1) - 1]
++
++# Remove missing values
++prices = na.omit(prices)
++
++# Set SPY returns as market returns
++spy_ret = na.omit(prices[symbol == "spy", .(date, market_ret = returns)])
++prices = spy_ret[prices, on = "date"]
++
++# Minimal observations per symbol is 253 days
++remove_symbols = prices[, .(symbol, n = .N), by = symbol][n < 253, symbol]
++prices = prices[symbol %notin% remove_symbols]
++
++# Free memory
++gc()
++
++
++# PREDICTORS --------------------------------------------------------------
++# Rolling beta
++setorder(prices, symbol, date)
++prices = prices[, beta := RollingBeta(market_ret, returns, 252, na_method = "ignore"),
++                by = symbol]
++
++# Highest beta by date - 5% of symbols by highest beta
++prices[, beta_rank := frank(abs(beta), ties.method = "dense", na.last = "keep"), by = date]
++prices[, beta_rank_pct := beta_rank / max(beta_rank, na.rm = TRUE), by = date]
++prices[, beta_rank_largest_99 := 0, by = date]
++prices[beta_rank_pct > 0.99, beta_rank_largest_99 := 1, by = date]
++prices[, beta_rank_largest_95 := 0, by = date]
++prices[beta_rank_pct > 0.95, beta_rank_largest_95 := 1, by = date]
++prices[, beta_rank_largest_90 := 0, by = date]
++prices[beta_rank_pct > 0.90, beta_rank_largest_90 := 1, by = date]
++setorder(prices, symbol, date)
++
++# Momentum predictors
++months_size = c(3, 6, 9, 12)
++mom_vars = paste0("momentum_", months_size)
++f_ = function(x, n) {
++  shift(x, 21) / shift(x, n * 21) - 1
++}
++prices[, (mom_vars) := lapply(months_size, function(x) f_(close, x)), by = symbol]
++
++# Momentum ensambles
++weights_ = c(12, 6, 3, 1) / sum(c(12, 6, 3, 1))
++prices[, momentum_average := momentum_3 * weights_[1] +
++         momentum_6 * weights_[2] +
++         momentum_9 * weights_[3] +
++         momentum_12 * weights_[4]]
++
++# Dolar volume z-score
++dv_cols = paste0("dollar_volume_zscore_winsorized", months_size)
++f_ = function(x, y, z) RollingZscore(as.numeric(x * y), z, na_method = "ignore")
++prices[, (dv_cols) := lapply(months_size, function(s)  as.vector(f_(close_raw, volume, s * 21))),
++       by = symbol]
++prices[, (dv_cols) := lapply(.SD, function(x) Winsorize(x, val = c(-5, 5))),
++       .SDcols = dv_cols]
++
++# Tecnical indicators
++prices[, rsi := RSI(close, n = 14), by = symbol]
++
++# Remove columns we don't need
++prices[, c("beta_rank", "beta_rank_pct", "open", "high", "low", "volume") := NULL]
++
++# Save local temporarily
++if (!dir.exists("data")) dir.create("data")
++fwrite(prices, "data/prices.csv")
++
++# Add file to padobran
++
