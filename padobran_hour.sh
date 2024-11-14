@@ -4,7 +4,7 @@
 #PBS -N ERFHOUR
 #PBS -l ncpus=8
 #PBS -l mem=4GB
-#PBS -J 1-3
+#PBS -J 1-829
 #PBS -o logs_hour
 #PBS -j oe
 

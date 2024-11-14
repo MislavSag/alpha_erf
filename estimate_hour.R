@@ -42,25 +42,25 @@ if (file.exists(file_name)) {
 } else {
   # estimation
   l = list()
-  for (i in 1:length(dates)) { # 1:length(dates
-    d = dates[i]
+  for (j in 1:length(dates)) { # 1:length(dates
+    d = dates[j]
     # d = dates[10000]
     
     # Train data
     dtd = dt[date < d]
     if (nrow(dtd) < 7 * 252) {
-      l[[i]] = NULL
+      l[[j]] = NULL
       next
     } 
     if (d - dt[, max(date)] > 1) {
-      l[[i]] = NULL
+      l[[j]] = NULL
       next
     }
     
     # Test data
     test_data = dt[date == d]
     if (nrow(test_data) == 0) {
-      l[[i]] = NULL
+      l[[j]] = NULL
       next
     }
     
@@ -91,7 +91,7 @@ if (file.exists(file_name)) {
     colnames(erf_predictions_upper) = paste0("upper_", colnames(erf_predictions_upper))
     erf_predictions_lower = clean_names(as.data.frame(erf_predictions_lower))
     colnames(erf_predictions_lower) = paste0("lower_", colnames(erf_predictions_lower))
-    l[[i]] = cbind(
+    l[[j]] = cbind(
       symbol = s,
       date = d,
       erf_predictions_upper,
