@@ -144,13 +144,13 @@ sh_file = sprintf("
 
 #PBS -N ERFHOUR
 #PBS -l ncpus=8
-#PBS -l mem=10GB
+#PBS -l mem=4GB
 #PBS -J 1-%d
 #PBS -o logs_hour
 #PBS -j oe
 
 cd ${PBS_O_WORKDIR}
-apptainer run image.sif estimate.R
+apptainer run image.sif estimate_hour.R
 ", prices[, length(unique(id))])
 sh_file_name = "padobran_hour.sh"
 file.create(sh_file_name)

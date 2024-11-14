@@ -9,5 +9,5 @@
 #PBS -j oe
 
 cd ${PBS_O_WORKDIR}
-apptainer run image.sif estimate.R
+apptainer run image.sif estimate_hour.R
 
