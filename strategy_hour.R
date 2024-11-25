@@ -39,8 +39,7 @@ erf_predictions = rbindlist(erf_predictions)
 # Check timezones
 attr(erf_predictions$date, "tzone")
 Sys.timezone()
-# erf_predictions[, date := force_tz(date, tz = Sys.timezone())]
-erf_predictions[, date := as.POSIXct(date, tz = "America/New_York")]
+erf_predictions[, date := with_tz(date, tz = "America/New_York")]
 
 # Summary
 erf_predictions[, .(
@@ -49,13 +48,15 @@ erf_predictions[, .(
   number_observations = .N
 )]
 
-# Daily prices
-prices = open_dataset("/home/sn/lean/data/stocks_hour.csv", format = "csv") |>
-  dplyr::filter(Symbol %in% erf_predictions[, unique(symbol)]) |>
-  dplyr::rename(symbol = Symbol, date = Date, open = Open, high = High, 
-                low = Low, close = Close, volume = Volume, adj_close = `Adj Close`) |>
+# Hour prices
+prices = open_dataset(file.path(QCDATA, "stocks_hour.csv"), format = "csv") |>
+  dplyr::filter(Symbol %in% spy_symbols) |>
+  dplyr::rename(symbol = Symbol, date = Date, open = Open, high = High, low = Low, 
+                close = Close, volume = Volume, adj_close = `Adj Close`) |>
+  dplyr::mutate(date = force_tz(date, "America/New_York")) |>
   collect()
 setDT(prices)
+attr(prices$date, "tz")
 prices = unique(prices, by = c("symbol", "date"))
 prices[, adj_rate := adj_close / close]
 prices[, let(
@@ -77,16 +78,21 @@ remove_symbols = prices[, .(symbol, n = .N), by = symbol][n < 253, symbol]
 prices = prices[symbol %notin% remove_symbols]
 gc()
 
-# Check datetimes
-erf_predictions[, unique(symbol)]
-s = "cars"
-x = erf_predictions[symbol == s, .(symbol, date, targetr)]
-y = prices[symbol == s, .(symbol, date, returns)]
-i = c("2024-01-01", "2024-02-01")
-tail(x[date %between% i], 30); tail(y[date %between% i], 30);
+# # Check datetimes
+# erf_predictions[, unique(symbol)]
+# s = "cars"
+# x = erf_predictions[symbol == s, .(symbol, date, targetr)]
+# y = prices[symbol == s, .(symbol, date, returns)]
+# i = c("2024-01-01", "2024-02-01")
+# tail(x[date %between% i], 20); tail(y[date %between% i], 20);
+# 
+# # Move by one hour !?
+# erf_predictions[, date_erf := date]
+# prices[, date_prices := date]
+# test = prices[erf_predictions, on = c("symbol", "date"), roll = Inf]
+# test[, .(symbol, date, date_erf, date_prices)]
+# tail(test[symbol == "ctx", .(symbol, date, date_erf, date_prices)], 15)
 
-# Move by one hour !?
-qc_data[, date := as.Date(vapply(as.Date(date), qlcal::advanceDate, FUN.VALUE = double(1L), days = 1))]
 
 # PREPARE -----------------------------------------------------------------
 # Convert all predictors to numeric
@@ -273,7 +279,7 @@ storage_write_csv(qc_data, cont, paste0("erf_", back_[1, symbol], ".csv"))
 
 # PORTFOLIO ---------------------------------------------------------------
 # Portfolio returns
-portfolio = erf_predictions[, .(symbol, date, stand_q95, stand_q995, targetr)]
+portfolio = erf_predictions[, .(symbol, date, stand_q95, stand_q995, stand_q99, targetr)]
 portfolio[, signal := 0]
 portfolio[shift(stand_q95) > 0, signal := 1]
 # portfolio[, signal := shift(signal, 1), by = symbol]
@@ -299,32 +305,11 @@ setorder(qc_data, date)
 storage_write_csv(qc_data, cont, "erf.csv")
 colnames(qc_data)
 
-# LIQUID PORTFOLIO --------------------------------------------------------
-# Keep only most liquid stocks
-prices_sample = prices[liquid_500 == TRUE]
-
-# Merge erf_predictions with prices
-portfolio = erf_predictions[, .(symbol, date, stand_q95, stand_q98, stand_q99, stand_q995, targetr)][
-  prices_sample[, .(symbol, date, returns)], on = c("symbol", "date")]
-portfolio = na.omit(portfolio)
-
-# Backtest
-portfolio[, signal := 0]
-portfolio[stand_q95 > 0, signal := 1]
-portfolio[, weights := signal / nrow(.SD[signal == 1]), by = date]
-setorder(portfolio, date)
-portfolio_ret = portfolio[, .(returns = sum(targetr * weights, na.rm = TRUE)), by = date]
-portfolio_ret = as.xts.data.table(portfolio_ret)
-table.AnnualizedReturns(portfolio_ret)
-maxDrawdown(portfolio_ret)
-charts.PerformanceSummary(portfolio_ret)
-charts.PerformanceSummary(portfolio_ret["2020-01/"])
-
 # PORTFOLIO CROSS SECTION -------------------------------------------------
 library(portsort)
 # Downsample to monthly frequency
 dtm = copy(prices)
-dtm[, year_month_id := lubridate::ceiling_date(date, unit = "week")]
+dtm[, year_month_id := lubridate::ceiling_date(date, unit = "day")]
 dtm = dtm[, .(
   date = tail(date, 1),
   open = head(open, 1),
@@ -429,11 +414,12 @@ storage_write_csv(qc_data, cont, "erf_sort.csv")
 
 # SYSTEMIC RISK -----------------------------------------------------------
 # SPY
-spy = open_dataset("/home/sn//lean/data/stocks_hour.csv", format = "csv") |>
+spy = open_dataset(file.path(QCDATA, "stocks_hour.csv"), format = "csv") |>
   dplyr::filter(Symbol == "spy") |>
   dplyr::select(Date, `Adj Close`) |>
   dplyr::rename(date = Date, close = `Adj Close`) |>
-  dplyr::collect()
+  dplyr::mutate(date = force_tz(date, "America/New_York")) |>
+  collect()
 setDT(spy)
 spy[, returns := close / shift(close) - 1]
 
@@ -454,38 +440,8 @@ plot(as.xts.data.table(sr),
      legend.loc = "topleft")
 
 # Backtest
-back = spy[, .(date, returns)][sr, on = "date"]
-setorder(back, date)
-predictors = colnames(back)[3:ncol(back)]
-back[, (predictors) := lapply(.SD, shift, n = 1), .SDcols = predictors]
-back[, strategy := ifelse(mean > -0.3, returns, 0)]
-back_xts = as.xts.data.table(na.omit(back)[, .(date, strategy, returns)])
-# table.AnnualizedReturns(back_xts)
-maxDrawdown(back_xts)
-charts.PerformanceSummary(back_xts)
-charts.PerformanceSummary(back_xts["2020/"])
-
-# Aggreagte by dollar volume
-# prices_sample = prices[liquid_100 == TRUE]
-sr = erf_predictions[, .(symbol, date, stand_q95, stand_q995, targetr)]
-setorder(sr, symbol, date)
-sr = na.omit(sr)
-# sr = prices_sample[sr, on = c("symbol", "date")]
-sr = na.omit(sr)
-sr = sr[, .(
-  mean = mean(stand_q95),
-  median = median(stand_q95),
-  sd = sd(stand_q95)
-), by = date]
-plot(as.xts.data.table(sr),
-     main = "Systemic Risk",
-     ylab = "Standardized Quantile 95",
-     col = c("blue", "red", "green"),
-     lwd = 2,
-     legend.loc = "topleft")
-
-# Backtest
-back = spy[, .(date, returns)][sr, on = "date"]
+back = sr[spy[, .(date, returns)], on = "date"]
+# back = spy[, .(date, returns)][sr, on = "date"]
 setorder(back, date)
 predictors = colnames(back)[3:ncol(back)]
 back[, (predictors) := lapply(.SD, shift, n = 1), .SDcols = predictors]

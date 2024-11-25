@@ -44,11 +44,11 @@ if (file.exists(file_name)) {
   l = list()
   for (j in 1:length(dates)) { # 1:length(dates
     d = dates[j]
-    # d = dates[10000]
+    # d = dates[40000]
     
     # Train data
     dtd = dt[date < d]
-    if (nrow(dtd) < 7 * 252) {
+    if (nrow(dtd) < 7 * 1008) {
       l[[j]] = NULL
       next
     } 
@@ -63,6 +63,9 @@ if (file.exists(file_name)) {
       l[[j]] = NULL
       next
     }
+    
+    # Choose last n observation (rolling window)
+    dtd = tail(dtd, 7 * 1008)
     
     # Fit model for upper
     train_data_upper = dtd[target > 0]
