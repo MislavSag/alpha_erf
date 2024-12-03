@@ -5,18 +5,18 @@ library(data.table)
 library(erf)
 library(AzureStor)
 library(arrow)
+library(dplyr)
 library(PerformanceAnalytics)
 library(ggplot2)
 library(TTR)
 
 
-
 # CHECKS ------------------------------------------------------------------
-# Check have many symbols are in total
-files = list.files("data", full.names = TRUE, pattern = "csv")
-symbols = lapply(files, fread, select = "symbol") 
-symbols = rbindlist(symbols)
-symbols[, length(unique(symbol))]
+# # Check have many symbols are in total
+# files = list.files("data", full.names = TRUE, pattern = "csv")
+# symbols = lapply(files, fread, select = "symbol") 
+# symbols = rbindlist(symbols)
+# symbols[, length(unique(symbol))]
 
 
 # DATA --------------------------------------------------------------------
@@ -72,6 +72,7 @@ setcolorder(prices, c("symbol", "date", "open", "high", "low", "close", "volume"
 prices = prices[open > 1e-008 & high > 1e-008 & low > 1e-008 & close > 1e-008]
 setorder(prices, symbol, date)
 prices[, returns := close / shift(close, 1) - 1]
+prices[, returns_intra := close / open - 1]
 prices = na.omit(prices)
 spy_ret = na.omit(prices[symbol == "spy", .(date, market_ret = returns)])
 prices = spy_ret[prices, on = "date"]
@@ -291,7 +292,7 @@ storage_write_csv(qc_data, cont, paste0("erf_", back_[1, symbol], ".csv"))
 # Portfolio returns
 portfolio = erf_predictions[, .(symbol, date, stand_q95, stand_q995, targetr)]
 portfolio[, signal := 0]
-portfolio[shift(stand_q95) > 2, signal := 1]
+portfolio[shift(stand_q95) > 0, signal := 1]
 # portfolio[, signal := shift(signal, 1), by = symbol]
 portfolio[, weights := signal / nrow(.SD[signal == 1]), by = date]
 setorder(portfolio, date)
@@ -317,30 +318,55 @@ colnames(qc_data)
 
 # LIQUID PORTFOLIO --------------------------------------------------------
 # Keep only most liquid stocks
-prices_sample = prices[liquid_500 == TRUE]
+# prices_sample = prices[liquid_1000 == TRUE]
 
 # Merge erf_predictions with prices
 portfolio = erf_predictions[, .(symbol, date, stand_q95, stand_q98, stand_q99, stand_q995, targetr)][
-  prices_sample[, .(symbol, date, returns)], on = c("symbol", "date")]
+  prices[, .(symbol, date, returns, returns_intra)], on = c("symbol", "date")]
 portfolio = na.omit(portfolio)
+setorder(portfolio, symbol, date)
 
 # Backtest
 portfolio[, signal := 0]
-portfolio[stand_q95 > 0, signal := 1]
-portfolio[, weights := signal / nrow(.SD[signal == 1]), by = date]
+portfolio[shift(stand_q95) > 0 & shift(stand_q995) > 0, signal := 1, by = symbol]
+portfolio[signal == 1, weights := signal / nrow(.SD[signal == 1]), by = date]
+portfolio[, target_intra := shift(returns_intra, -1, type = "shift"), by = symbol]
 setorder(portfolio, date)
-portfolio_ret = portfolio[, .(returns = sum(targetr * weights, na.rm = TRUE)), by = date]
+portfolio_ret = portfolio[, .(returns = sum(target_intra * weights, na.rm = TRUE)), by = date]
 portfolio_ret = as.xts.data.table(portfolio_ret)
 table.AnnualizedReturns(portfolio_ret)
 maxDrawdown(portfolio_ret)
 charts.PerformanceSummary(portfolio_ret)
 charts.PerformanceSummary(portfolio_ret["2020-01/"])
+charts.PerformanceSummary(portfolio_ret["2023-01/2024-01"])
+
+# Add all to QC
+trade_ = "open" # Can be open or close
+qc_data = portfolio[, .(symbol, date, weights, stand_q995, stand_q95)]
+setorder(qc_data, date)
+########### USE THIS TO TRADE NEXT DAY ON OPENING ########
+qc_data[, date := as.Date(vapply(as.Date(date), qlcal::advanceDate, FUN.VALUE = double(1L), days = 1))]
+qc_data[, date := paste0(as.character(date), " 09:31:00")]
+########### USE THIS TO TRADE NEXT DAY ON OPENING ########
+########### USE THIS TO TRADE 1 MIN BEFORE CLOSE ########
+# qc_data[, date := paste0(as.character(date), " 16:00:00")]
+########### USE THIS TO TRADE 1 MIN BEFORE CLOSE ########
+qc_data = qc_data[, .(
+  symbol = paste0(symbol, collapse = "|"),
+  qr_99 = paste0(stand_q995, collapse = "|"),
+  qr_95 = paste0(stand_q95, collapse = "|")),
+  by = date]
+storage_write_csv(qc_data, cont, "erf.csv")
+colnames(qc_data)
 
 # PORTFOLIO CROSS SECTION -------------------------------------------------
 library(portsort)
 # Downsample to monthly frequency
-dtm = copy(prices)
-dtm[, year_month_id := lubridate::ceiling_date(date, unit = "week")]
+# dtm = copy(prices)
+dtm = prices[liquid_500 == TRUE]
+# dtm[, year_month_id := lubridate::ceiling_date(date, unit = "month")]
+# dtm[, year_month_id := data.table::yearmon(date)]
+dtm[, year_month_id := zoo::as.yearmon(date)]
 dtm = dtm[, .(
   date = tail(date, 1),
   open = head(open, 1),
@@ -351,15 +377,16 @@ dtm = dtm[, .(
   volume_mean = mean(volume, na.rm = TRUE),
   volume = sum(volume, na.rm = TRUE)
 ), by = c("symbol", "year_month_id")]
-dtm = erf_predictions[, .(symbol, date, stand_q95, stand_q98, stand_q99, stand_q995, targetr)][
+dtm = erf_predictions[, .(symbol, date, stand_q95, stand_q98, stand_q99, stand_q995)][
   dtm, on = c("symbol", "date")]
 dtm = na.omit(dtm)
 dtm = dtm[close_raw > 1]
 
-# create forward returns
+# Create forward returns
 setorder(dtm, symbol, date)
 dtm[, ret_forward := shift(close, -1, type = "shift") / close - 1, by = symbol]
-dtm[, .(symbol, year_month_id, close, ret_forward)]
+dtm[, ret_forward_intra := shift(close, -1, type = "shift") / shift(open, -1, type = "shift") - 1, by = symbol]
+dtm[, .(symbol, year_month_id, close, ret_forward, ret_forward_intra)]
 dtm = na.omit(dtm)
 
 # Portfolio sort
@@ -379,6 +406,7 @@ for (i in seq_along(predictors)) {
   
   # remove NA values for target
   sample = na.omit(sample)
+  sample[, year_month_id := as.Date(year_month_id)]
   
   # predictors matrix
   Fa = dcast(sample, year_month_id ~ symbol, value.var = predictor)
@@ -422,36 +450,72 @@ results_dt = rbindlist(results, idcol = "predictor")
 results_dt[grep("Sharpe", rn)]
 results_dt[grep("Retu", rn)]
 
-# Create quantile portfolio for every week
-portfolio_sort_week = erf_predictions[, .(symbol, date, stand_q95, targetr)]
-portfolio_sort_week = na.omit(portfolio_sort_week)
-setorder(portfolio_sort_week, date, -stand_q95)
-portfolio_sort_week = portfolio_sort_week[, head(.SD, 50), by = date]
-portfolio_sort_week = portfolio_sort_week[date < as.Date("2024-10-01")]
-portfolio_sort_week[, weight := 1 / nrow(.SD), by = date]
-portfolio_returns = portfolio_sort_week[, sum(targetr * weight, na.rm = TRUE), by = date]
-charts.PerformanceSummary(as.xts.data.table(portfolio_returns))
-charts.PerformanceSummary(as.xts.data.table(portfolio_returns)["2024"])
+# Create quantile portfolio for every month
+portfolio_sort = dtm[, .(symbol, date, year_month_id, stand_q95, ret_forward, ret_forward_intra)]
+portfolio_sort = na.omit(portfolio_sort)
+setorder(portfolio_sort, year_month_id, -stand_q95)
+portfolio_sort = portfolio_sort[, head(.SD, 5), by = year_month_id]
+portfolio_sort = portfolio_sort[date < as.Date("2024-10-01")]
+portfolio_sort[, weight := 1 / nrow(.SD), by = year_month_id]
+portfolio_returns = portfolio_sort[, sum(ret_forward_intra * weight, na.rm = TRUE), by = year_month_id]
+prxts = as.xts.data.table(portfolio_returns[, .(date = as.Date(zoo::as.yearmon(year_month_id)), V1)])
+charts.PerformanceSummary(prxts)
+charts.PerformanceSummary(prxts["2020/2024-10"])
+charts.PerformanceSummary(prxts["2010/"])
+charts.PerformanceSummary(prxts["2010/2014"])
 
 # Save to Quantconnect
-qc_data = portfolio_sort_week[stand_q95 > 0]
-qc_data[, date := paste0(as.character(date), " 16:00:00")]
+qc_data = copy(portfolio_sort)
+qc_data[, date_month := lubridate::ceiling_date(date, unit = "month") -1]
+qc_data[, date_business := vapply(date_month, qlcal::isBusinessDay, FUN.VALUE = logical(1))]
+qc_data[, date_month_business := date_month]
+qc_data[date_business == FALSE, 
+        date_month_business := as.Date(vapply(date_month, 
+                                              qlcal::advanceDate, 
+                                              FUN.VALUE = double(1L), 
+                                              days = 1))] # bdc = "Preceding"
+qc_data[date_business == FALSE]
+qc_data[, unique(date_month_business)]
+setorder(qc_data, date_month_business)
+qc_data[, date_month_business := paste0(as.character(date_month_business), " 15:59:00")]
+qc_data[, symbol := gsub("\\..*", "", symbol)]
 qc_data = qc_data[, .(
   symbol = paste0(symbol, collapse = "|"),
   qr_95 = paste0(stand_q95, collapse = "|")),
-  by = date]
-setorder(qc_data, date)
+  by = date_month_business]
 storage_write_csv(qc_data, cont, "erf_sort.csv")
+colnames(qc_data)
+
+# Compare QC and local
+qc_data = copy(portfolio_sort)
+qc_data[, date_month := lubridate::ceiling_date(date, unit = "month") -1]
+qc_data[, date_business := vapply(date_month, qlcal::isBusinessDay, FUN.VALUE = logical(1))]
+qc_data[, date_month_business := date_month]
+setorder(qc_data, date_month_business)
+qc_data = qc_data[date > as.Date("2010-01-01")]
+head(qc_data, 10)
+qc_data[grep("\\.", symbol)]
+qc_data[grep("\\.", symbol), sum(ret_forward)]
+qc_data[, sum(ret_forward)]
+
 
 # SYSTEMIC RISK -----------------------------------------------------------
 # SPY
 spy = open_dataset("/home/sn//lean/data/stocks_daily.csv", format = "csv") |>
   dplyr::filter(Symbol == "spy") |>
-  dplyr::select(Date, `Adj Close`) |>
-  dplyr::rename(date = Date, close = `Adj Close`) |>
-  dplyr::collect()
+  dplyr::select(Date, Open, Close, `Adj Close`) |>
+  dplyr::rename(date = Date, open = Open, close_raw = Close, close = `Adj Close`) |>
+  dplyr::mutate(open = (close / close_raw) * open) |>
+  dplyr::select(date, open, close) |>
+  collect()
 setDT(spy)
 spy[, returns := close / shift(close) - 1]
+spy[, returns_intra := close / open - 1]
+spy = na.omit(spy)
+plot(as.xts.data.table(spy[, .(date, close)]))
+plot(as.xts.data.table(spy[, .(date, returns)]))
+charts.PerformanceSummary(as.xts.data.table(spy[, .(date, returns)]))
+charts.PerformanceSummary(as.xts.data.table(spy[, .(date, returns_intra)]))
 
 # Simple aggregation
 sr = erf_predictions[, .(symbol, date, stand_q95, stand_q995, targetr)]
@@ -470,11 +534,11 @@ plot(as.xts.data.table(sr),
      legend.loc = "topleft")
 
 # Backtest
-back = spy[, .(date, returns)][sr, on = "date"]
+back = sr[spy[, .(date, returns, returns_intra)], on = "date"]
 setorder(back, date)
-predictors = colnames(back)[3:ncol(back)]
-back[, (predictors) := lapply(.SD, shift, n = 1), .SDcols = predictors]
-back[, strategy := ifelse(mean > -0.3, returns, 0)]
+# predictors = colnames(back)[3:ncol(back)]
+# back[, (predictors) := lapply(.SD, shift, n = 1), .SDcols = predictors]
+back[, strategy := ifelse(shift(mean) > -0.2, returns, 0)]
 back_xts = as.xts.data.table(na.omit(back)[, .(date, strategy, returns)])
 table.AnnualizedReturns(back_xts)
 maxDrawdown(back_xts)
@@ -501,11 +565,11 @@ plot(as.xts.data.table(sr),
      legend.loc = "topleft")
 
 # Backtest
-back = spy[, .(date, returns)][sr, on = "date"]
+back = sr[spy[, .(date, returns)], on = "date"]
 setorder(back, date)
-predictors = colnames(back)[3:ncol(back)]
-back[, (predictors) := lapply(.SD, shift, n = 1), .SDcols = predictors]
-back[, strategy := ifelse(mean > 0, returns, 0)]
+# predictors = colnames(back)[3:ncol(back)]
+# back[, (predictors) := lapply(.SD, shift, n = 1), .SDcols = predictors]
+back[, strategy := ifelse(shift(mean) > 0, returns_intra, 0)]
 back_xts = as.xts.data.table(na.omit(back)[, .(date, strategy, returns)])
 table.AnnualizedReturns(back_xts)
 maxDrawdown(back_xts)
@@ -513,7 +577,7 @@ charts.PerformanceSummary(back_xts)
 charts.PerformanceSummary(back_xts["2020/"])
 
 # Add to Quantconnect
-qc_data = spy[, .(date, returns)][sr, on = "date"]
+qc_data = sr[spy[, .(date, returns)], on = "date"]
 setorder(qc_data, date)
 qc_data = qc_data[, .(date, mean)]
 qc_data[, date := paste0(as.character(date), " 16:00:00")]

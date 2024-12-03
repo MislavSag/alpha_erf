@@ -49,8 +49,9 @@ erf_predictions[, .(
 )]
 
 # Hour prices
+QCDATA = "/home/sn/lean/data"
 prices = open_dataset(file.path(QCDATA, "stocks_hour.csv"), format = "csv") |>
-  dplyr::filter(Symbol %in% spy_symbols) |>
+  dplyr::filter(Symbol %in% erf_predictions[, unique(symbol)]) |>
   dplyr::rename(symbol = Symbol, date = Date, open = Open, high = High, low = Low, 
                 close = Close, volume = Volume, adj_close = `Adj Close`) |>
   dplyr::mutate(date = force_tz(date, "America/New_York")) |>
@@ -71,6 +72,7 @@ setcolorder(prices, c("symbol", "date", "open", "high", "low", "close", "volume"
 prices = prices[open > 1e-008 & high > 1e-008 & low > 1e-008 & close > 1e-008]
 setorder(prices, symbol, date)
 prices[, returns := close / shift(close, 1) - 1]
+prices[, returns_intra := close / open - 1]
 prices = na.omit(prices)
 spy_ret = na.omit(prices[symbol == "spy", .(date, market_ret = returns)])
 prices = spy_ret[prices, on = "date"]
@@ -229,7 +231,7 @@ ggplot(dt_[stand_q95 > 0], aes(x = stand_q95, y = targetr)) +
 
 
 # Plot cumulative returns
-# symbol_ = "spy"
+# symbol_ = "invh"
 symbol_ = erf_predictions[, sample(unique(symbol), 1)]
 back_ = erf_predictions[symbol == symbol_]
 back_ = generate_signal(back_, 0, n = 0, q = "995")
@@ -281,7 +283,7 @@ storage_write_csv(qc_data, cont, paste0("erf_", back_[1, symbol], ".csv"))
 # Portfolio returns
 portfolio = erf_predictions[, .(symbol, date, stand_q95, stand_q995, stand_q99, targetr)]
 portfolio[, signal := 0]
-portfolio[shift(stand_q95) > 0, signal := 1]
+portfolio[shift(stand_q95) > 0.5, signal := 1]
 # portfolio[, signal := shift(signal, 1), by = symbol]
 portfolio[, weights := signal / nrow(.SD[signal == 1]), by = date]
 setorder(portfolio, date)
@@ -416,12 +418,20 @@ storage_write_csv(qc_data, cont, "erf_sort.csv")
 # SPY
 spy = open_dataset(file.path(QCDATA, "stocks_hour.csv"), format = "csv") |>
   dplyr::filter(Symbol == "spy") |>
-  dplyr::select(Date, `Adj Close`) |>
-  dplyr::rename(date = Date, close = `Adj Close`) |>
+  dplyr::select(Date, Open, Close, `Adj Close`) |>
+  dplyr::rename(date = Date, open = Open, close_raw = Close, close = `Adj Close`) |>
+  dplyr::mutate(open = (close / close_raw) * open) |>
+  dplyr::select(date, open, close) |>
   dplyr::mutate(date = force_tz(date, "America/New_York")) |>
   collect()
-setDT(spy)
+spy = as.data.table(spy)
 spy[, returns := close / shift(close) - 1]
+spy[, returns_intra := close / open - 1]
+spy = na.omit(spy)
+plot(as.xts.data.table(spy[, .(date, close)]))
+plot(as.xts.data.table(spy[, .(date, returns)]))
+charts.PerformanceSummary(as.xts.data.table(spy[, .(date, returns)]))
+charts.PerformanceSummary(as.xts.data.table(spy[, .(date, returns_intra)]))
 
 # Simple aggregation
 sr = erf_predictions[, .(symbol, date, stand_q95, stand_q995, targetr)]
@@ -429,8 +439,8 @@ setorder(sr, symbol, date)
 sr = na.omit(sr)
 sr = sr[, .(
   mean = mean(stand_q95, na.rm = TRUE),
-  median = median(stand_q95, na.rm = TRUE)
-  # sd = sd(stand_q95, na.rm = TRUE)
+  median = median(stand_q95, na.rm = TRUE),
+  sd = sd(stand_q95, na.rm = TRUE)
 ), by = date]
 plot(as.xts.data.table(sr),
      main = "Systemic Risk",
@@ -438,23 +448,33 @@ plot(as.xts.data.table(sr),
      col = c("blue", "red", "green"),
      lwd = 2,
      legend.loc = "topleft")
+sr_ema = copy(sr)
+sr_ema = sr[, names(.SD) := lapply(.SD, TTR::EMA, n = 7*2), .SDcols = 2:ncol(sr)]
+plot(as.xts.data.table(sr_ema),
+     main = "Systemic Risk",
+     ylab = "Standardized Quantile 95",
+     col = c("blue", "red", "green"),
+     lwd = 2,
+     legend.loc = "topleft")
 
 # Backtest
-back = sr[spy[, .(date, returns)], on = "date"]
-# back = spy[, .(date, returns)][sr, on = "date"]
+back = sr_ema[spy[, .(date, returns, returns_intra)], on = "date"]
 setorder(back, date)
-predictors = colnames(back)[3:ncol(back)]
-back[, (predictors) := lapply(.SD, shift, n = 1), .SDcols = predictors]
-back[, strategy := ifelse(mean > 0, returns, 0)]
-back_xts = as.xts.data.table(na.omit(back)[, .(date, strategy, returns)])
+# predictors = back[, colnames(.SD), .SDcols = -c("date", "returns")]
+# back[, (predictors) := lapply(.SD, shift, n = 1), .SDcols = predictors]
+back[, strategy := fifelse(shift(mean) > 0, 0, returns)]
+# back[, strategy := fifelse(shift(sd) > 1, 0, returns)]
+back[is.na(strategy), strategy := 0]
+back_xts = as.xts.data.table(na.omit(back[, .(date, strategy, returns)]))
 # table.AnnualizedReturns(back_xts)
 maxDrawdown(back_xts)
+SharpeRatio(back_xts)
 charts.PerformanceSummary(back_xts)
 charts.PerformanceSummary(back_xts["2020/"])
 
 # Add to Quantconnect
-qc_data = spy[, .(date, returns)][sr, on = "date"]
+qc_data = sr[spy[, .(date, returns)], on = "date"]
 setorder(qc_data, date)
-qc_data = qc_data[, .(date, mean)]
-qc_data[, date := paste0(as.character(date), " 16:00:00")]
-storage_write_csv(qc_data, cont, paste0("erf_risk.csv"))
+qc_data = qc_data[, .(date = as.character(date), mean)]
+qc_data = na.omit(qc_data)
+storage_write_csv(qc_data, cont, paste0("erf_risk_hour.csv"))
